@@ -5,11 +5,12 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-postgres = "0.7"
-postgres-native-tls = "0.5"
-native-tls = "0.2"
 aws-config = "1"
 aws-sdk-dsql = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tokio-retry = "0.3.0"
 anyhow = { version = "1.0.98", features = ["backtrace"] }
+sqlx = { version = "0.8", features = [ "runtime-tokio", "tls-rustls" , "postgres", "uuid"] }
+indicatif = "0.17"
+hdrhistogram = "7.5"
+chrono = "0.4"
