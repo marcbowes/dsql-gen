@@ -44,6 +44,7 @@ struct Args {
     batches: usize,
 }
 
+#[derive(Clone)]
 struct MetricsInner {
     completed_batches: usize,
     completed_since_last_tick: usize,
@@ -98,28 +99,8 @@ impl Metrics {
         inner.last_errors.push_back(error);
     }
 
-    fn get_stats(&self) -> (usize, f64, usize, Vec<String>, f64, f64, f64, f64) {
-        let inner = self.inner.lock().unwrap();
-        let completed = inner.completed_batches;
-        let progress_pct = (completed as f64 / self.total_batches as f64) * 100.0;
-        let error_count = inner.error_count;
-        let last_errors = inner.last_errors.iter().cloned().collect();
-
-        let p50 = inner.latency_histogram.value_at_quantile(0.50) as f64;
-        let p90 = inner.latency_histogram.value_at_quantile(0.90) as f64;
-        let p99 = inner.latency_histogram.value_at_quantile(0.99) as f64;
-        let p999 = inner.latency_histogram.value_at_quantile(0.999) as f64;
-
-        (
-            completed,
-            progress_pct,
-            error_count,
-            last_errors,
-            p50,
-            p90,
-            p99,
-            p999,
-        )
+    fn read(&self) -> MetricsInner {
+        self.inner.lock().unwrap().clone()
     }
 
     fn get_and_reset_tps(&self, interval_secs: f64) -> f64 {
@@ -167,10 +148,10 @@ async fn establish_connection_pool(
         .ssl_mode(sqlx::postgres::PgSslMode::VerifyFull);
 
     let pool = PgPoolOptions::new()
-        .max_connections(max_connections) // Increased for better concurrency
+        .max_connections(max_connections)
         .acquire_timeout(Duration::from_secs(30))
-        .idle_timeout(Duration::from_secs(10))
-        .max_lifetime(Duration::from_secs(30 * 60)) // 30 minutes
+        .idle_timeout(Duration::from_secs(3600))
+        .max_lifetime(Duration::from_secs(3600))
         .connect_with(connection_options.clone())
         .await?;
 
@@ -229,40 +210,46 @@ async fn execute_batch(pool: &Pool<Postgres>, sql: String, _batch_id: usize) -> 
     Ok(())
 }
 
-async fn monitor_progress(metrics: Metrics, progress_bar: ProgressBar) {
+async fn monitor_progress(metrics: Metrics, pool: Pool<Postgres>, progress_bar: ProgressBar) {
     let mut interval = time::interval(Duration::from_secs(5));
     let interval_secs = 5.0;
-    
+
     loop {
         interval.tick().await;
 
         // Get TPS and reset counter
         let tps = metrics.get_and_reset_tps(interval_secs);
-        
-        let (completed, progress_pct, error_count, last_errors, p50, p90, p99, p999) =
-            metrics.get_stats();
+
+        let m = metrics.read();
 
         // Update progress bar
-        progress_bar.set_position(completed as u64);
+        progress_bar.set_position(m.completed_batches as u64);
 
         // Print stats
         println!(
             "\n========== {} ==========",
             Local::now().format("%Y-%m-%d %H:%M:%S")
         );
+        let progress_pct = (m.completed_batches as f64 / metrics.total_batches as f64) * 100.0;
         println!(
             "Progress: {}/{} ({:.1}%)",
-            completed, metrics.total_batches, progress_pct
+            m.completed_batches, metrics.total_batches, progress_pct
         );
         println!("TPS: {:.1} batches/sec", tps);
-        println!("Errors: {} total", error_count);
+        println!("Errors: {} total", m.error_count);
+        println!("Pool: {} open, {} idle", pool.size(), pool.num_idle());
 
-        if !last_errors.is_empty() {
-            println!("Last {} errors:", last_errors.len());
-            for (i, error) in last_errors.iter().enumerate() {
+        if !m.last_errors.is_empty() {
+            println!("Last {} errors:", m.last_errors.len());
+            for (i, error) in m.last_errors.iter().enumerate() {
                 println!("  {}: {}", i + 1, error);
             }
         }
+
+        let p50 = m.latency_histogram.value_at_quantile(0.50) as f64;
+        let p90 = m.latency_histogram.value_at_quantile(0.90) as f64;
+        let p99 = m.latency_histogram.value_at_quantile(0.99) as f64;
+        let p999 = m.latency_histogram.value_at_quantile(0.999) as f64;
 
         println!("Latency (ms):");
         println!("  p50: {:.1}", p50);
@@ -270,7 +257,7 @@ async fn monitor_progress(metrics: Metrics, progress_bar: ProgressBar) {
         println!("  p99: {:.1}", p99);
         println!("  p99.9: {:.1}", p999);
 
-        if completed >= metrics.total_batches {
+        if m.completed_batches >= metrics.total_batches {
             break;
         }
     }
@@ -299,8 +286,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start monitoring task
     let monitor_metrics = metrics.clone();
     let monitor_progress_bar = progress_bar.clone();
+    let _pool = pool.clone();
     let monitor_handle = tokio::spawn(async move {
-        monitor_progress(monitor_metrics, monitor_progress_bar).await;
+        monitor_progress(monitor_metrics, _pool, monitor_progress_bar).await;
     });
 
     let mut set = JoinSet::new();
@@ -325,8 +313,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     time::sleep(Duration::from_millis(100)).await;
 
     println!("\nCompleted {} batches", args.batches);
-    let (_, _, error_count, _, _, _, _, _) = metrics.get_stats();
-    println!("Total errors: {}", error_count);
+    let metrics = metrics.read();
+    println!("Total errors: {}", metrics.error_count);
 
     // Cancel the monitor task
     monitor_handle.abort();
