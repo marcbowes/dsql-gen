@@ -46,6 +46,7 @@ struct Args {
 
 struct MetricsInner {
     completed_batches: usize,
+    completed_since_last_tick: usize,
     error_count: usize,
     last_errors: VecDeque<String>,
     latency_histogram: Histogram<u64>,
@@ -61,6 +62,7 @@ impl Metrics {
     fn new(total_batches: usize) -> Self {
         let inner = MetricsInner {
             completed_batches: 0,
+            completed_since_last_tick: 0,
             error_count: 0,
             last_errors: VecDeque::with_capacity(3),
             latency_histogram: Histogram::<u64>::new_with_bounds(1, 60_000, 3).unwrap(),
@@ -75,6 +77,7 @@ impl Metrics {
     fn record_success(&self, duration_ms: u64) {
         let mut inner = self.inner.lock().unwrap();
         inner.completed_batches += 1;
+        inner.completed_since_last_tick += 1;
 
         inner
             .latency_histogram
@@ -117,6 +120,13 @@ impl Metrics {
             p99,
             p999,
         )
+    }
+
+    fn get_and_reset_tps(&self, interval_secs: f64) -> f64 {
+        let mut inner = self.inner.lock().unwrap();
+        let completed = inner.completed_since_last_tick;
+        inner.completed_since_last_tick = 0;
+        completed as f64 / interval_secs
     }
 }
 
@@ -221,9 +231,14 @@ async fn execute_batch(pool: &Pool<Postgres>, sql: String, _batch_id: usize) -> 
 
 async fn monitor_progress(metrics: Metrics, progress_bar: ProgressBar) {
     let mut interval = time::interval(Duration::from_secs(5));
+    let interval_secs = 5.0;
+    
     loop {
         interval.tick().await;
 
+        // Get TPS and reset counter
+        let tps = metrics.get_and_reset_tps(interval_secs);
+        
         let (completed, progress_pct, error_count, last_errors, p50, p90, p99, p999) =
             metrics.get_stats();
 
@@ -239,6 +254,7 @@ async fn monitor_progress(metrics: Metrics, progress_bar: ProgressBar) {
             "Progress: {}/{} ({:.1}%)",
             completed, metrics.total_batches, progress_pct
         );
+        println!("TPS: {:.1} batches/sec", tps);
         println!("Errors: {} total", error_count);
 
         if !last_errors.is_empty() {
