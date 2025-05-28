@@ -29,7 +29,7 @@ struct Args {
 
     /// Number of concurrent connections
     #[arg(short, long, default_value_t = 10)]
-    concurrency: usize,
+    concurrency: u32,
 
     /// SQL query to execute per batch
     #[arg(
@@ -44,61 +44,68 @@ struct Args {
     batches: usize,
 }
 
+struct MetricsInner {
+    completed_batches: usize,
+    error_count: usize,
+    last_errors: VecDeque<String>,
+    latency_histogram: Histogram<u64>,
+}
+
 #[derive(Clone)]
 struct Metrics {
-    completed_batches: Arc<Mutex<usize>>,
-    error_count: Arc<Mutex<usize>>,
-    last_errors: Arc<Mutex<VecDeque<String>>>,
-    latency_histogram: Arc<Mutex<Histogram<u64>>>,
+    inner: Arc<Mutex<MetricsInner>>,
     total_batches: usize,
 }
 
 impl Metrics {
     fn new(total_batches: usize) -> Self {
+        let inner = MetricsInner {
+            completed_batches: 0,
+            error_count: 0,
+            last_errors: VecDeque::with_capacity(3),
+            latency_histogram: Histogram::<u64>::new_with_bounds(1, 60_000, 3).unwrap(),
+        };
+
         Self {
-            completed_batches: Arc::new(Mutex::new(0)),
-            error_count: Arc::new(Mutex::new(0)),
-            last_errors: Arc::new(Mutex::new(VecDeque::with_capacity(3))),
-            latency_histogram: Arc::new(Mutex::new(
-                Histogram::<u64>::new_with_bounds(1, 60_000, 3).unwrap(),
-            )),
+            inner: Arc::new(Mutex::new(inner)),
             total_batches,
         }
     }
 
     fn record_success(&self, duration_ms: u64) {
-        let mut completed = self.completed_batches.lock().unwrap();
-        *completed += 1;
+        let mut inner = self.inner.lock().unwrap();
+        inner.completed_batches += 1;
 
-        let mut histogram = self.latency_histogram.lock().unwrap();
-        histogram.record(duration_ms).unwrap_or_else(|_| {
-            // If value is out of range, record the max value
-            histogram.record(60_000).unwrap();
-        });
+        inner
+            .latency_histogram
+            .record(duration_ms)
+            .unwrap_or_else(|_| {
+                // If value is out of range, record the max value
+                inner.latency_histogram.record(60_000).unwrap();
+            });
     }
 
     fn record_error(&self, error: String) {
-        let mut count = self.error_count.lock().unwrap();
-        *count += 1;
+        let mut inner = self.inner.lock().unwrap();
+        inner.error_count += 1;
 
-        let mut errors = self.last_errors.lock().unwrap();
-        if errors.len() >= 3 {
-            errors.pop_front();
+        if inner.last_errors.len() >= 3 {
+            inner.last_errors.pop_front();
         }
-        errors.push_back(error);
+        inner.last_errors.push_back(error);
     }
 
     fn get_stats(&self) -> (usize, f64, usize, Vec<String>, f64, f64, f64, f64) {
-        let completed = *self.completed_batches.lock().unwrap();
+        let inner = self.inner.lock().unwrap();
+        let completed = inner.completed_batches;
         let progress_pct = (completed as f64 / self.total_batches as f64) * 100.0;
-        let error_count = *self.error_count.lock().unwrap();
-        let last_errors = self.last_errors.lock().unwrap().iter().cloned().collect();
+        let error_count = inner.error_count;
+        let last_errors = inner.last_errors.iter().cloned().collect();
 
-        let histogram = self.latency_histogram.lock().unwrap();
-        let p50 = histogram.value_at_quantile(0.50) as f64;
-        let p90 = histogram.value_at_quantile(0.90) as f64;
-        let p99 = histogram.value_at_quantile(0.99) as f64;
-        let p999 = histogram.value_at_quantile(0.999) as f64;
+        let p50 = inner.latency_histogram.value_at_quantile(0.50) as f64;
+        let p90 = inner.latency_histogram.value_at_quantile(0.90) as f64;
+        let p99 = inner.latency_histogram.value_at_quantile(0.99) as f64;
+        let p999 = inner.latency_histogram.value_at_quantile(0.999) as f64;
 
         (
             completed,
@@ -127,6 +134,7 @@ async fn generate_password_token(
 async fn establish_connection_pool(
     endpoint: String,
     region: String,
+    max_connections: u32,
 ) -> anyhow::Result<Pool<Postgres>> {
     let sdk_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
     let signer = AuthTokenGenerator::new(
@@ -149,7 +157,7 @@ async fn establish_connection_pool(
         .ssl_mode(sqlx::postgres::PgSslMode::VerifyFull);
 
     let pool = PgPoolOptions::new()
-        .max_connections(20) // Increased for better concurrency
+        .max_connections(max_connections) // Increased for better concurrency
         .acquire_timeout(Duration::from_secs(30))
         .idle_timeout(Duration::from_secs(10))
         .max_lifetime(Duration::from_secs(30 * 60)) // 30 minutes
@@ -257,7 +265,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     println!("Establishing connection pool...");
-    let pool = establish_connection_pool(args.endpoint.clone(), args.region.clone()).await?;
+    let pool =
+        establish_connection_pool(args.endpoint.clone(), args.region.clone(), args.concurrency)
+            .await?;
     println!("Connection pool established successfully");
 
     // Setup metrics and progress bar
@@ -280,7 +290,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut set = JoinSet::new();
 
     for i in 0..args.batches {
-        while set.len() >= args.concurrency {
+        while set.len() >= args.concurrency as usize {
             set.join_next().await;
         }
         set.spawn(execute_batch_with_retry(
