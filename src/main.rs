@@ -104,11 +104,12 @@ impl Metrics {
     }
 
     fn get_and_reset(&self) -> (usize, Histogram<u64>) {
-        let inner = self.inner.lock().unwrap();
-        (
-            inner.completed_since_last_tick,
-            inner.latency_histogram.clone(),
-        )
+        let mut inner = self.inner.lock().unwrap();
+        let completed = inner.completed_since_last_tick;
+        inner.completed_since_last_tick = 0;
+        let histogram = inner.latency_histogram.clone();
+        inner.latency_histogram.reset();
+        (completed, histogram)
     }
 }
 
