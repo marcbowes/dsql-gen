@@ -103,11 +103,12 @@ impl Metrics {
         self.inner.lock().unwrap().clone()
     }
 
-    fn get_and_reset_tps(&self, interval_secs: f64) -> f64 {
-        let mut inner = self.inner.lock().unwrap();
-        let completed = inner.completed_since_last_tick;
-        inner.completed_since_last_tick = 0;
-        completed as f64 / interval_secs
+    fn get_and_reset(&self) -> (usize, Histogram<u64>) {
+        let inner = self.inner.lock().unwrap();
+        (
+            inner.completed_since_last_tick,
+            inner.latency_histogram.clone(),
+        )
     }
 }
 
@@ -218,7 +219,8 @@ async fn monitor_progress(metrics: Metrics, pool: Pool<Postgres>, progress_bar: 
         interval.tick().await;
 
         // Get TPS and reset counter
-        let tps = metrics.get_and_reset_tps(interval_secs);
+        let (completed, latency_histogram) = metrics.get_and_reset();
+        let tps = completed as f64 / interval_secs;
 
         let m = metrics.read();
 
@@ -246,10 +248,10 @@ async fn monitor_progress(metrics: Metrics, pool: Pool<Postgres>, progress_bar: 
             }
         }
 
-        let p50 = m.latency_histogram.value_at_quantile(0.50) as f64;
-        let p90 = m.latency_histogram.value_at_quantile(0.90) as f64;
-        let p99 = m.latency_histogram.value_at_quantile(0.99) as f64;
-        let p999 = m.latency_histogram.value_at_quantile(0.999) as f64;
+        let p50 = latency_histogram.value_at_quantile(0.50) as f64;
+        let p90 = latency_histogram.value_at_quantile(0.90) as f64;
+        let p99 = latency_histogram.value_at_quantile(0.99) as f64;
+        let p999 = latency_histogram.value_at_quantile(0.999) as f64;
 
         println!("Latency (ms):");
         println!("  p50: {:.1}", p50);
