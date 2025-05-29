@@ -35,13 +35,23 @@ struct Args {
     #[arg(
         short,
         long,
-        default_value = "INSERT INTO test (content) SELECT md5(random()::text) FROM generate_series(1, 1000)"
+        default_value = "INSERT INTO test (content) VALUES (substring(repeat(md5(random()::text), 32), 1, 988))"
     )]
     sql: String,
 
     /// Total number of batches to execute
     #[arg(short, long, default_value_t = 2000)]
     batches: usize,
+
+    /// SQL for creating the table if it doesn't exist
+    #[arg(
+        long,
+        default_value = "CREATE TABLE IF NOT EXISTS test (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    content text
+);"
+    )]
+    create_table_sql: String,
 }
 
 #[derive(Clone)]
@@ -117,10 +127,10 @@ async fn generate_password_token(
     signer: &AuthTokenGenerator,
     sdk_config: &SdkConfig,
 ) -> anyhow::Result<AuthToken> {
-    Ok(signer
+    signer
         .db_connect_admin_auth_token(sdk_config)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to generate auth token: {}", e))?)
+        .map_err(|e| anyhow::anyhow!("Failed to generate auth token: {}", e))
 }
 
 /// Establish a pooled connection with periodic credential refresh.
@@ -275,6 +285,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         establish_connection_pool(args.endpoint.clone(), args.region.clone(), args.concurrency)
             .await?;
     println!("Connection pool established successfully");
+
+    sqlx::query(&args.create_table_sql).execute(&pool).await?;
 
     // Setup metrics and progress bar
     let metrics = Metrics::new(args.batches);
