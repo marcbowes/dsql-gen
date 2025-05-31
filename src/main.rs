@@ -76,7 +76,7 @@ impl Metrics {
             completed_since_last_tick: 0,
             error_count: 0,
             last_errors: VecDeque::with_capacity(3),
-            latency_histogram: Histogram::<u64>::new_with_bounds(1, 60_000, 3).unwrap(),
+            latency_histogram: Histogram::<u64>::new_with_bounds(1, 60_000 * 10, 3).unwrap(),
         };
 
         Self {
