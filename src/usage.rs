@@ -16,7 +16,7 @@ pub struct UsageCalculator {
     cloudwatch_client: CloudWatchClient,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DpuMetrics {
     pub total: f64,
     pub compute: f64,
@@ -37,7 +37,7 @@ impl ops::Sub for DpuMetrics {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DpuCost {
     pub total: f64,
     pub compute: f64,
@@ -58,7 +58,7 @@ impl ops::Sub for DpuCost {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StorageMetrics {
     pub size_bytes: f64,
 }
@@ -73,7 +73,7 @@ impl ops::Sub for StorageMetrics {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StorageCost {
     pub gb_month: f64,
 }
@@ -88,7 +88,7 @@ impl ops::Sub for StorageCost {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Usage {
     pub dpu_metrics: DpuMetrics,
     pub storage_metrics: StorageMetrics,
@@ -108,7 +108,27 @@ impl ops::Sub for Usage {
 }
 
 impl Usage {
-    pub fn recalculate(&mut self) {
+    pub fn set_dpu_metrics(&mut self, updated: DpuMetrics) -> bool {
+        if self.dpu_metrics == updated {
+            return false;
+        }
+
+        self.dpu_metrics = updated;
+        self.recalculate();
+        true
+    }
+
+    pub fn set_storage_metrics(&mut self, updated: StorageMetrics) -> bool {
+        if self.storage_metrics == updated {
+            return false;
+        }
+
+        self.storage_metrics = updated;
+        self.recalculate();
+        true
+    }
+
+    fn recalculate(&mut self) {
         self.cost_estimate = calculate_costs(&self.dpu_metrics, &self.storage_metrics);
     }
 }
@@ -128,7 +148,7 @@ impl Usage {
 ///
 /// If you want to adapt this calculator for your own purpose, please make sure
 /// you understand pricing, and your use-case.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CostEstimate {
     pub total_dpus: DpuCost,
     pub latest_storage: StorageCost,

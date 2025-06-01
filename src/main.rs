@@ -295,53 +295,84 @@ async fn monitor_progress(
         println!("  p99: {:.1}", p99);
         println!("  p99.9: {:.1}", p999);
 
-        // Print stats
-        let latest_usage = usage.borrow().clone();
-        let usage_diff = latest_usage - prev_usage;
-        println!("================= Usage ==================");
-        println!(
-            "Total DPUS: {} (+{}) = {} (+ {})",
-            latest_usage.dpu_metrics.total,
-            usage_diff.dpu_metrics.total,
-            latest_usage.cost_estimate.total_dpus.total,
-            usage_diff.cost_estimate.total_dpus.total,
-        );
-        println!(
-            "    - Compute DPUS: {} (+{}) = {} (+ {})",
-            latest_usage.dpu_metrics.compute,
-            usage_diff.dpu_metrics.compute,
-            latest_usage.cost_estimate.total_dpus.compute,
-            usage_diff.cost_estimate.total_dpus.compute,
-        );
-        println!(
-            "    - Read DPUS: {} (+{}) = {} (+ {})",
-            latest_usage.dpu_metrics.read,
-            usage_diff.dpu_metrics.read,
-            latest_usage.cost_estimate.total_dpus.read,
-            usage_diff.cost_estimate.total_dpus.read,
-        );
-        println!(
-            "    - Write DPUS: {} (+{}) = {} (+ {})",
-            latest_usage.dpu_metrics.write,
-            usage_diff.dpu_metrics.write,
-            latest_usage.cost_estimate.total_dpus.write,
-            usage_diff.cost_estimate.total_dpus.write,
-        );
-        println!(
-            "Storage: {} (+{}) = {} (+ {})",
-            Byte::from_u64(latest_usage.storage_metrics.size_bytes as u64)
-                .get_appropriate_unit(byte_unit::UnitType::Decimal),
-            Byte::from_u64(usage_diff.storage_metrics.size_bytes as u64)
-                .get_appropriate_unit(byte_unit::UnitType::Decimal),
-            latest_usage.cost_estimate.total_dpus.write,
-            usage_diff.cost_estimate.total_dpus.write,
-        );
-        prev_usage = latest_usage;
+        if usage.has_changed().unwrap() {
+            let latest_usage = usage.borrow().clone();
+            let usage_diff = latest_usage - prev_usage;
+            print_usage_and_diff(&latest_usage, &usage_diff);
+            prev_usage = latest_usage;
+        }
 
         if m.completed_batches >= metrics.total_batches {
             break;
         }
     }
+}
+
+fn print_usage(latest_usage: &Usage) {
+    println!("================= Usage ==================");
+    println!(
+        "Total DPUS: {:.2} = ${:.2}",
+        latest_usage.dpu_metrics.total, latest_usage.cost_estimate.total_dpus.total,
+    );
+    println!(
+        "    - Compute DPUS: {:.2} = ${:.2}",
+        latest_usage.dpu_metrics.compute, latest_usage.cost_estimate.total_dpus.compute,
+    );
+    println!(
+        "    - Read DPUS: {:.2} = ${:.2}",
+        latest_usage.dpu_metrics.read, latest_usage.cost_estimate.total_dpus.read,
+    );
+    println!(
+        "    - Write DPUS: {:.2} = ${:.2}",
+        latest_usage.dpu_metrics.write, latest_usage.cost_estimate.total_dpus.write,
+    );
+    println!(
+        "Storage: {} = ${:.2}",
+        Byte::from_u64(latest_usage.storage_metrics.size_bytes as u64)
+            .get_appropriate_unit(byte_unit::UnitType::Decimal),
+        latest_usage.cost_estimate.total_dpus.write,
+    );
+}
+
+fn print_usage_and_diff(latest_usage: &Usage, usage_diff: &Usage) {
+    println!("================= Usage ==================");
+    println!(
+        "Total DPUS: {:.2} (+{:.2}) = ${:.2} (+ ${:.2})",
+        latest_usage.dpu_metrics.total,
+        usage_diff.dpu_metrics.total,
+        latest_usage.cost_estimate.total_dpus.total,
+        usage_diff.cost_estimate.total_dpus.total,
+    );
+    println!(
+        "    - Compute DPUS: {:.2} (+{:.2}) = ${:.2} (+ ${:.2})",
+        latest_usage.dpu_metrics.compute,
+        usage_diff.dpu_metrics.compute,
+        latest_usage.cost_estimate.total_dpus.compute,
+        usage_diff.cost_estimate.total_dpus.compute,
+    );
+    println!(
+        "    - Read DPUS: {:.2} (+{:.2}) = ${:.2} (+ ${:.2})",
+        latest_usage.dpu_metrics.read,
+        usage_diff.dpu_metrics.read,
+        latest_usage.cost_estimate.total_dpus.read,
+        usage_diff.cost_estimate.total_dpus.read,
+    );
+    println!(
+        "    - Write DPUS: {:.2} (+{:.2}) = ${:.2} (+ ${:.2})",
+        latest_usage.dpu_metrics.write,
+        usage_diff.dpu_metrics.write,
+        latest_usage.cost_estimate.total_dpus.write,
+        usage_diff.cost_estimate.total_dpus.write,
+    );
+    println!(
+        "Storage: {} (+{}) = ${:.2} (+ ${:.2})",
+        Byte::from_u64(latest_usage.storage_metrics.size_bytes as u64)
+            .get_appropriate_unit(byte_unit::UnitType::Decimal),
+        Byte::from_u64(usage_diff.storage_metrics.size_bytes as u64)
+            .get_appropriate_unit(byte_unit::UnitType::Decimal),
+        latest_usage.cost_estimate.total_dpus.write,
+        usage_diff.cost_estimate.total_dpus.write,
+    );
 }
 
 #[tokio::main]
@@ -382,27 +413,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dpu_metrics = dpus.unwrap();
     let storage_metrics = storage.unwrap();
     let cost_estimate = usage::calculate_costs(&dpu_metrics, &storage_metrics);
-
-    let (tx, rx) = watch::channel(Usage {
+    let initial_usage = Usage {
         dpu_metrics,
         storage_metrics,
         cost_estimate,
-    });
+    };
+    print_usage(&initial_usage);
+
+    let (tx, rx) = watch::channel(initial_usage.clone());
 
     let usage_task = tokio::spawn(async move {
         loop {
             if let Ok(it) = cal.dpus_this_month().await {
-                tx.send_modify(move |usage| {
-                    usage.dpu_metrics = it;
-                    usage.recalculate();
-                });
+                tx.send_if_modified(move |usage| usage.set_dpu_metrics(it));
             }
 
             if let Ok(it) = cal.current_storage_usage().await {
-                tx.send_modify(move |usage| {
-                    usage.storage_metrics = it;
-                    usage.recalculate();
-                });
+                tx.send_if_modified(move |usage| usage.set_storage_metrics(it));
             }
 
             sleep(Duration::from_secs(30)).await;
@@ -423,8 +450,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let monitor_metrics = metrics.clone();
     let monitor_progress_bar = progress_bar.clone();
     let _pool = pool.clone();
+    let watch_usage = rx.clone();
     let monitor_handle = tokio::spawn(async move {
-        monitor_progress(monitor_metrics, _pool, monitor_progress_bar, rx).await;
+        monitor_progress(monitor_metrics, _pool, monitor_progress_bar, watch_usage).await;
     });
 
     let mut set = JoinSet::new();
@@ -453,6 +481,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Total errors: {}", metrics.error_count);
 
     monitor_handle.abort();
+
+    println!("waiting for final usage");
+    sleep(Duration::from_secs(90)).await;
+    let final_usage = rx.borrow().clone();
+    print_usage_and_diff(&initial_usage, &final_usage);
+
     usage_task.abort();
 
     // Close the connection pool
