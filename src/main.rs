@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_sdk_dsql::auth_token::{AuthToken, AuthTokenGenerator, Config};
 use byte_unit::Byte;
@@ -23,9 +23,23 @@ use tokio_retry::{
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// AWS DSQL cluster endpoint
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Parser, Debug)]
+enum Commands {
+    /// Run the load generator
+    Run(RunArgs),
+    /// Print usage information for a cluster
+    Usage(UsageArgs),
+}
+
+#[derive(Parser, Debug)]
+struct RunArgs {
+    /// AWS DSQL cluster ID
     #[arg(short, long)]
-    endpoint: String,
+    identifier: String,
 
     /// AWS region
     #[arg(short, long, env = "AWS_REGION")]
@@ -58,14 +72,16 @@ struct Args {
     create_table_sql: String,
 }
 
-impl Args {
-    fn cluster_id(&self) -> Result<String> {
-        let token = self.endpoint.split(".").next();
-        let id = token.ok_or_else(|| anyhow!("invalid endpoint"))?;
-        if id.len() != 26 {
-            bail!("invalid endpoint");
-        }
-        Ok(id.to_string())
+impl RunArgs {
+    fn endpoint(&self, sdk_config: &SdkConfig) -> Result<String> {
+        let region = sdk_config
+            .region()
+            .ok_or_else(|| anyhow!("no region set"))?;
+        Ok(format!(
+            "{}.dsql.{}.on.aws",
+            self.identifier,
+            region.as_ref()
+        ))
     }
 
     async fn sdk_config(&self) -> SdkConfig {
@@ -75,6 +91,27 @@ impl Args {
         }
         loader.load().await
     }
+}
+
+impl UsageArgs {
+    async fn sdk_config(&self) -> SdkConfig {
+        let mut loader = aws_config::defaults(BehaviorVersion::latest());
+        if let Some(r) = &self.region {
+            loader = loader.region(Region::new(r.clone()));
+        }
+        loader.load().await
+    }
+}
+
+#[derive(Parser, Debug)]
+struct UsageArgs {
+    /// AWS DSQL cluster ID
+    #[arg(short, long)]
+    identifier: String,
+
+    /// AWS region
+    #[arg(short, long, env = "AWS_REGION")]
+    region: Option<String>,
 }
 
 #[derive(Clone)]
@@ -330,7 +367,7 @@ fn print_usage(latest_usage: &Usage) {
         "Storage: {} = ${:.2}",
         Byte::from_u64(latest_usage.storage_metrics.size_bytes as u64)
             .get_appropriate_unit(byte_unit::UnitType::Decimal),
-        latest_usage.cost_estimate.total_dpus.write,
+        latest_usage.cost_estimate.latest_storage.gb_month,
     );
 }
 
@@ -370,25 +407,26 @@ fn print_usage_and_diff(latest_usage: &Usage, usage_diff: &Usage) {
             .get_appropriate_unit(byte_unit::UnitType::Decimal),
         Byte::from_u64(usage_diff.storage_metrics.size_bytes as u64)
             .get_appropriate_unit(byte_unit::UnitType::Decimal),
-        latest_usage.cost_estimate.total_dpus.write,
-        usage_diff.cost_estimate.total_dpus.write,
+        latest_usage.cost_estimate.latest_storage.gb_month,
+        usage_diff.cost_estimate.latest_storage.gb_month,
     );
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+async fn run_load_generator(args: RunArgs) -> Result<()> {
     let sdk_config = args.sdk_config().await;
 
     println!("Establishing connection pool...");
-    let pool =
-        establish_connection_pool(args.endpoint.clone(), sdk_config.clone(), args.concurrency)
-            .await?;
+    let pool = establish_connection_pool(
+        args.endpoint(&sdk_config)?,
+        sdk_config.clone(),
+        args.concurrency,
+    )
+    .await?;
     println!("Connection pool established successfully");
 
     sqlx::query(&args.create_table_sql).execute(&pool).await?;
 
-    let cal = UsageCalculator::new(args.cluster_id()?, &sdk_config);
+    let cal = UsageCalculator::new(args.identifier, &sdk_config);
     let mut dpus = None;
     let mut storage = None;
 
@@ -491,6 +529,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Close the connection pool
     pool.close().await;
+
+    Ok(())
+}
+
+async fn print_cluster_usage(args: UsageArgs) -> anyhow::Result<()> {
+    let sdk_config = args.sdk_config().await;
+    let cal = UsageCalculator::new(args.identifier.clone(), &sdk_config);
+
+    println!(
+        "Fetching usage information for cluster: {}",
+        args.identifier
+    );
+
+    let dpu_metrics = cal.dpus_this_month().await?;
+    let storage_metrics = cal.current_storage_usage().await?;
+    let cost_estimate = usage::calculate_costs(&dpu_metrics, &storage_metrics);
+    let usage = Usage {
+        dpu_metrics,
+        storage_metrics,
+        cost_estimate,
+    };
+
+    print_usage(&usage);
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    match args.command {
+        Commands::Run(run_args) => run_load_generator(run_args).await?,
+        Commands::Usage(print_args) => print_cluster_usage(print_args).await?,
+    }
 
     Ok(())
 }
