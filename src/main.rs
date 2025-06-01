@@ -1,7 +1,10 @@
+use anyhow::{anyhow, bail, Result};
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_sdk_dsql::auth_token::{AuthToken, AuthTokenGenerator, Config};
+use byte_unit::Byte;
 use chrono::Local;
 use clap::Parser;
+use dsql_gen::usage::{self, Usage, UsageCalculator};
 use hdrhistogram::Histogram;
 use indicatif::{ProgressBar, ProgressStyle};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -9,8 +12,9 @@ use sqlx::{Pool, Postgres};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 use tokio::task::JoinSet;
-use tokio::time;
+use tokio::time::{self, sleep};
 use tokio_retry::{
     strategy::{jitter, ExponentialBackoff},
     Retry,
@@ -25,7 +29,7 @@ struct Args {
 
     /// AWS region
     #[arg(short, long, env = "AWS_REGION")]
-    region: String,
+    region: Option<String>,
 
     /// Number of concurrent connections
     #[arg(short, long, default_value_t = 10)]
@@ -52,6 +56,25 @@ struct Args {
 );"
     )]
     create_table_sql: String,
+}
+
+impl Args {
+    fn cluster_id(&self) -> Result<String> {
+        let token = self.endpoint.split(".").next();
+        let id = token.ok_or_else(|| anyhow!("invalid endpoint"))?;
+        if id.len() != 26 {
+            bail!("invalid endpoint");
+        }
+        Ok(id.to_string())
+    }
+
+    async fn sdk_config(&self) -> SdkConfig {
+        let mut loader = aws_config::defaults(BehaviorVersion::latest());
+        if let Some(r) = &self.region {
+            loader = loader.region(Region::new(r.clone()));
+        }
+        loader.load().await
+    }
 }
 
 #[derive(Clone)]
@@ -93,10 +116,7 @@ impl Metrics {
         inner
             .latency_histogram
             .record(duration_ms)
-            .unwrap_or_else(|_| {
-                // If value is out of range, record the max value
-                inner.latency_histogram.record(60_000).unwrap();
-            });
+            .expect("histogram is correctly configured");
     }
 
     fn record_error(&self, error: String) {
@@ -126,27 +146,25 @@ impl Metrics {
 async fn generate_password_token(
     signer: &AuthTokenGenerator,
     sdk_config: &SdkConfig,
-) -> anyhow::Result<AuthToken> {
+) -> Result<AuthToken> {
     signer
         .db_connect_admin_auth_token(sdk_config)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to generate auth token: {}", e))
+        .map_err(|e| anyhow!("Failed to generate auth token: {}", e))
 }
 
 /// Establish a pooled connection with periodic credential refresh.
 async fn establish_connection_pool(
     endpoint: String,
-    region: String,
+    sdk_config: SdkConfig,
     max_connections: u32,
-) -> anyhow::Result<Pool<Postgres>> {
-    let sdk_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+) -> Result<Pool<Postgres>> {
     let signer = AuthTokenGenerator::new(
         Config::builder()
             .hostname(&endpoint)
-            .region(Region::new(region))
             .expires_in(900)
             .build()
-            .map_err(|e| anyhow::anyhow!("Failed to build auth config: {}", e))?,
+            .map_err(|e| anyhow!("Failed to build auth config: {}", e))?,
     );
 
     let password_token = generate_password_token(&signer, &sdk_config).await?;
@@ -194,7 +212,7 @@ async fn execute_batch_with_retry(
     sql: String,
     batch_id: usize,
     metrics: Metrics,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     let retry_strategy = ExponentialBackoff::from_millis(10).map(jitter);
     let start = Instant::now();
 
@@ -217,14 +235,21 @@ async fn execute_batch_with_retry(
     }
 }
 
-async fn execute_batch(pool: &Pool<Postgres>, sql: String, _batch_id: usize) -> anyhow::Result<()> {
+async fn execute_batch(pool: &Pool<Postgres>, sql: String, _batch_id: usize) -> Result<()> {
     sqlx::query(&sql).execute(pool).await?;
     Ok(())
 }
 
-async fn monitor_progress(metrics: Metrics, pool: Pool<Postgres>, progress_bar: ProgressBar) {
+async fn monitor_progress(
+    metrics: Metrics,
+    pool: Pool<Postgres>,
+    progress_bar: ProgressBar,
+    usage: watch::Receiver<Usage>,
+) {
     let mut interval = time::interval(Duration::from_secs(5));
     let interval_secs = 5.0;
+
+    let mut prev_usage = (*usage.borrow()).clone();
 
     loop {
         interval.tick().await;
@@ -270,6 +295,49 @@ async fn monitor_progress(metrics: Metrics, pool: Pool<Postgres>, progress_bar: 
         println!("  p99: {:.1}", p99);
         println!("  p99.9: {:.1}", p999);
 
+        // Print stats
+        let latest_usage = usage.borrow().clone();
+        let usage_diff = latest_usage - prev_usage;
+        println!("================= Usage ==================");
+        println!(
+            "Total DPUS: {} (+{}) = {} (+ {})",
+            latest_usage.dpu_metrics.total,
+            usage_diff.dpu_metrics.total,
+            latest_usage.cost_estimate.total_dpus.total,
+            usage_diff.cost_estimate.total_dpus.total,
+        );
+        println!(
+            "    - Compute DPUS: {} (+{}) = {} (+ {})",
+            latest_usage.dpu_metrics.compute,
+            usage_diff.dpu_metrics.compute,
+            latest_usage.cost_estimate.total_dpus.compute,
+            usage_diff.cost_estimate.total_dpus.compute,
+        );
+        println!(
+            "    - Read DPUS: {} (+{}) = {} (+ {})",
+            latest_usage.dpu_metrics.read,
+            usage_diff.dpu_metrics.read,
+            latest_usage.cost_estimate.total_dpus.read,
+            usage_diff.cost_estimate.total_dpus.read,
+        );
+        println!(
+            "    - Write DPUS: {} (+{}) = {} (+ {})",
+            latest_usage.dpu_metrics.write,
+            usage_diff.dpu_metrics.write,
+            latest_usage.cost_estimate.total_dpus.write,
+            usage_diff.cost_estimate.total_dpus.write,
+        );
+        println!(
+            "Storage: {} (+{}) = {} (+ {})",
+            Byte::from_u64(latest_usage.storage_metrics.size_bytes as u64)
+                .get_appropriate_unit(byte_unit::UnitType::Decimal),
+            Byte::from_u64(usage_diff.storage_metrics.size_bytes as u64)
+                .get_appropriate_unit(byte_unit::UnitType::Decimal),
+            latest_usage.cost_estimate.total_dpus.write,
+            usage_diff.cost_estimate.total_dpus.write,
+        );
+        prev_usage = latest_usage;
+
         if m.completed_batches >= metrics.total_batches {
             break;
         }
@@ -279,14 +347,67 @@ async fn monitor_progress(metrics: Metrics, pool: Pool<Postgres>, progress_bar: 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let sdk_config = args.sdk_config().await;
 
     println!("Establishing connection pool...");
     let pool =
-        establish_connection_pool(args.endpoint.clone(), args.region.clone(), args.concurrency)
+        establish_connection_pool(args.endpoint.clone(), sdk_config.clone(), args.concurrency)
             .await?;
     println!("Connection pool established successfully");
 
     sqlx::query(&args.create_table_sql).execute(&pool).await?;
+
+    let cal = UsageCalculator::new(args.cluster_id()?, &sdk_config);
+    let mut dpus = None;
+    let mut storage = None;
+
+    loop {
+        if let Ok(it) = cal.dpus_this_month().await {
+            dpus = Some(it)
+        }
+        if let Ok(it) = cal.current_storage_usage().await {
+            storage = Some(it)
+        };
+
+        if dpus.is_some() && storage.is_some() {
+            break;
+        }
+
+        // XXX: New clusters will always have metrics due to the initial table
+        // creation. Wait for them to come through.
+        println!("no metrics yet, assuming this is a new cluster, retrying..");
+        sleep(Duration::from_secs(30)).await;
+    }
+
+    let dpu_metrics = dpus.unwrap();
+    let storage_metrics = storage.unwrap();
+    let cost_estimate = usage::calculate_costs(&dpu_metrics, &storage_metrics);
+
+    let (tx, rx) = watch::channel(Usage {
+        dpu_metrics,
+        storage_metrics,
+        cost_estimate,
+    });
+
+    let usage_task = tokio::spawn(async move {
+        loop {
+            if let Ok(it) = cal.dpus_this_month().await {
+                tx.send_modify(move |usage| {
+                    usage.dpu_metrics = it;
+                    usage.recalculate();
+                });
+            }
+
+            if let Ok(it) = cal.current_storage_usage().await {
+                tx.send_modify(move |usage| {
+                    usage.storage_metrics = it;
+                    usage.recalculate();
+                });
+            }
+
+            sleep(Duration::from_secs(30)).await;
+        }
+    });
 
     // Setup metrics and progress bar
     let metrics = Metrics::new(args.batches);
@@ -303,7 +424,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let monitor_progress_bar = progress_bar.clone();
     let _pool = pool.clone();
     let monitor_handle = tokio::spawn(async move {
-        monitor_progress(monitor_metrics, _pool, monitor_progress_bar).await;
+        monitor_progress(monitor_metrics, _pool, monitor_progress_bar, rx).await;
     });
 
     let mut set = JoinSet::new();
@@ -331,8 +452,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metrics = metrics.read();
     println!("Total errors: {}", metrics.error_count);
 
-    // Cancel the monitor task
     monitor_handle.abort();
+    usage_task.abort();
 
     // Close the connection pool
     pool.close().await;
