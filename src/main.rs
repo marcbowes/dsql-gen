@@ -5,6 +5,7 @@ use byte_unit::Byte;
 use chrono::Local;
 use clap::Parser;
 use dsql_gen::usage::{self, Usage, UsageCalculator};
+use dsql_gen::workload::{self, Workload};
 use hdrhistogram::Histogram;
 use indicatif::{ProgressBar, ProgressStyle};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -49,27 +50,17 @@ struct RunArgs {
     #[arg(short, long, default_value_t = 10)]
     concurrency: u32,
 
-    /// SQL query to execute per batch
-    #[arg(
-        short,
-        long,
-        default_value = "INSERT INTO test (content) VALUES (substring(repeat(md5(random()::text), 32), 1, 988))"
-    )]
-    sql: String,
-
     /// Total number of batches to execute
     #[arg(short, long, default_value_t = 2000)]
     batches: usize,
 
-    /// SQL for creating the table if it doesn't exist
-    #[arg(
-        long,
-        default_value = "CREATE TABLE IF NOT EXISTS test (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    content text
-);"
-    )]
-    create_table_sql: String,
+    /// Workload name
+    #[arg(short, long)]
+    workload: String,
+
+    /// Workload rows
+    #[arg(short = 'n', long, default_value_t = 0)]
+    rows: usize,
 }
 
 impl RunArgs {
@@ -280,6 +271,7 @@ async fn execute_batch(pool: &Pool<Postgres>, sql: String, _batch_id: usize) -> 
 async fn monitor_progress(
     metrics: Metrics,
     pool: Pool<Postgres>,
+    workload: Workload,
     progress_bar: ProgressBar,
     usage: watch::Receiver<Usage>,
 ) {
@@ -310,7 +302,16 @@ async fn monitor_progress(
             "Progress: {}/{} ({:.1}%)",
             m.completed_batches, metrics.total_batches, progress_pct
         );
-        println!("TPS: {:.1} batches/sec", tps);
+        let rps = tps * workload.rows_inserted as f64;
+        let bps = (rps * workload.per_row_logical_bytes_written as f64) as u64;
+        let bps = Byte::from_u64(bps as u64).get_appropriate_unit(byte_unit::UnitType::Binary);
+        println!(
+            "Throughput: {} transactions/sec, {} rows/sec, {:.2} {}/sec",
+            tps as u64,
+            rps as u64,
+            bps.get_value(),
+            bps.get_unit()
+        );
         println!("Errors: {} total", m.error_count);
         println!("Pool: {} open, {} idle", pool.size(), pool.num_idle());
 
@@ -415,6 +416,11 @@ fn print_usage_and_diff(latest_usage: &Usage, usage_diff: &Usage) {
 async fn run_load_generator(args: RunArgs) -> Result<()> {
     let sdk_config = args.sdk_config().await;
 
+    let workloads = workload::load_all(args.rows);
+    let workload = workloads
+        .get(&args.workload)
+        .ok_or_else(|| anyhow!("unknown workload"))?;
+
     println!("Establishing connection pool...");
     let pool = establish_connection_pool(
         args.endpoint(&sdk_config)?,
@@ -424,7 +430,12 @@ async fn run_load_generator(args: RunArgs) -> Result<()> {
     .await?;
     println!("Connection pool established successfully");
 
-    sqlx::query(&args.create_table_sql).execute(&pool).await?;
+    sqlx::query(&workload.setup).execute(&pool).await?;
+
+    if args.rows == 0 {
+        println!("setup complete, no rows requested");
+        return Ok(());
+    }
 
     let cal = UsageCalculator::new(args.identifier, &sdk_config);
     let mut dpus = None;
@@ -488,9 +499,17 @@ async fn run_load_generator(args: RunArgs) -> Result<()> {
     let monitor_metrics = metrics.clone();
     let monitor_progress_bar = progress_bar.clone();
     let _pool = pool.clone();
+    let _workload = workload.clone();
     let watch_usage = rx.clone();
     let monitor_handle = tokio::spawn(async move {
-        monitor_progress(monitor_metrics, _pool, monitor_progress_bar, watch_usage).await;
+        monitor_progress(
+            monitor_metrics,
+            _pool,
+            _workload,
+            monitor_progress_bar,
+            watch_usage,
+        )
+        .await;
     });
 
     let mut set = JoinSet::new();
@@ -501,7 +520,7 @@ async fn run_load_generator(args: RunArgs) -> Result<()> {
         }
         set.spawn(execute_batch_with_retry(
             pool.clone(),
-            args.sql.clone(),
+            workload.single_statement.clone(),
             i,
             metrics.clone(),
         ));
