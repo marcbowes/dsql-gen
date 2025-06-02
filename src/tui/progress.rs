@@ -28,10 +28,10 @@ impl<'a> Widget for ProgressWidget<'a> {
             .label(format!(
                 "{}/{} ({:.1}%)",
                 self.model.metrics.completed_batches,
-                self.model.total_batches,
+                self.model.runner.batches(),
                 self.model.progress_pct
             ));
-        
+
         progress_gauge.render(area, buf);
     }
 }

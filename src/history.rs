@@ -33,7 +33,7 @@ impl<T> TimestampedDataPoint<T> {
 #[derive(Clone, Debug)]
 pub struct TimestampedHistory<T> {
     data: VecDeque<TimestampedDataPoint<T>>,
-    window_duration: Duration,
+    pub window_duration: Duration,
 }
 
 impl<T> TimestampedHistory<T> {
@@ -52,17 +52,17 @@ impl<T> TimestampedHistory<T> {
 
     /// Add a new data point with a specific timestamp
     pub fn push_with_timestamp(&mut self, value: T, timestamp: Instant) {
-        self.data.push_back(TimestampedDataPoint {
-            timestamp,
-            value,
-        });
+        self.data
+            .push_back(TimestampedDataPoint { timestamp, value });
         self.cleanup_old_data(timestamp);
     }
 
     /// Remove data points older than the window duration
     fn cleanup_old_data(&mut self, current_time: Instant) {
-        let cutoff_time = current_time.checked_sub(self.window_duration).unwrap_or(current_time);
-        
+        let cutoff_time = current_time
+            .checked_sub(self.window_duration)
+            .unwrap_or(current_time);
+
         while let Some(front) = self.data.front() {
             if front.timestamp < cutoff_time {
                 self.data.pop_front();
@@ -125,7 +125,7 @@ pub mod bucketing {
         F: Fn(&[&T]) -> f64,
     {
         let mut buckets = vec![default_value; config.total_buckets];
-        
+
         if data.is_empty() {
             return buckets;
         }
@@ -136,12 +136,13 @@ pub mod bucketing {
 
         // Group data points by bucket
         let mut bucket_data: Vec<Vec<&T>> = vec![Vec::new(); config.total_buckets];
-        
+
         for point in data {
             if point.timestamp >= start_time {
                 let elapsed = point.timestamp.duration_since(start_time);
-                let bucket_index = (elapsed.as_secs_f64() / config.bucket_duration.as_secs_f64()) as usize;
-                
+                let bucket_index =
+                    (elapsed.as_secs_f64() / config.bucket_duration.as_secs_f64()) as usize;
+
                 if bucket_index < config.total_buckets {
                     bucket_data[bucket_index].push(&point.value);
                 }
@@ -173,17 +174,17 @@ mod tests {
     #[test]
     fn test_timestamped_history() {
         let mut history = TimestampedHistory::new(Duration::from_secs(1));
-        
+
         history.push(1.0);
         history.push(2.0);
-        
+
         assert_eq!(history.len(), 2);
         assert!(!history.is_empty());
-        
+
         // Test cleanup by waiting and adding old data
         thread::sleep(Duration::from_millis(1100));
         history.push(3.0);
-        
+
         // Should have cleaned up old data
         assert!(history.len() <= 2);
     }
@@ -192,17 +193,29 @@ mod tests {
     fn test_bucketing() {
         let mut data = VecDeque::new();
         let now = Instant::now();
-        
+
         // Add some test data
-        data.push_back(TimestampedDataPoint::with_timestamp(1.0, now - Duration::from_secs(5)));
-        data.push_back(TimestampedDataPoint::with_timestamp(2.0, now - Duration::from_secs(3)));
-        data.push_back(TimestampedDataPoint::with_timestamp(3.0, now - Duration::from_secs(1)));
-        
+        data.push_back(TimestampedDataPoint::with_timestamp(
+            1.0,
+            now - Duration::from_secs(5),
+        ));
+        data.push_back(TimestampedDataPoint::with_timestamp(
+            2.0,
+            now - Duration::from_secs(3),
+        ));
+        data.push_back(TimestampedDataPoint::with_timestamp(
+            3.0,
+            now - Duration::from_secs(1),
+        ));
+
         let config = bucketing::BucketConfig::new(Duration::from_secs(2), 5);
-        let buckets = bucketing::bucket_data(&data, config, |values| {
-            values.iter().map(|&&v| v).sum::<f64>() / values.len() as f64
-        }, 0.0);
-        
+        let buckets = bucketing::bucket_data(
+            &data,
+            config,
+            |values| values.iter().map(|&&v| v).sum::<f64>() / values.len() as f64,
+            0.0,
+        );
+
         assert_eq!(buckets.len(), 5);
     }
 }

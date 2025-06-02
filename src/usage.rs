@@ -1,10 +1,14 @@
-use std::{ops, time::SystemTime};
+use std::{
+    ops,
+    time::{Duration, SystemTime},
+};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use aws_config::SdkConfig;
-use aws_sdk_cloudwatch::{types::Dimension, Client as CloudWatchClient};
+use aws_sdk_cloudwatch::{Client as CloudWatchClient, types::Dimension};
 use byte_unit::{Byte, Unit};
 use chrono::{Datelike, Timelike, Utc};
+use tokio::{sync::watch, time::sleep};
 
 /// Calculates usage based on CloudWatch metrics.
 ///
@@ -177,7 +181,7 @@ impl UsageCalculator {
 
     pub async fn dpus_this_month(&self) -> Result<DpuMetrics> {
         let (start_time, end_time) = this_month_to_now();
-        Ok(self.get_dpu_metrics(&start_time, &end_time).await?)
+        self.get_dpu_metrics(&start_time, &end_time).await
     }
 
     pub async fn current_storage_usage(&self) -> Result<StorageMetrics> {
@@ -277,6 +281,193 @@ impl UsageCalculator {
 
         Ok(sum)
     }
+
+    /// Get the initial usage
+    pub async fn get_initial_usage(&self) -> Result<Usage> {
+        let mut dpus = None;
+        let mut storage = None;
+
+        loop {
+            if let Ok(it) = self.dpus_this_month().await {
+                dpus = Some(it)
+            }
+            if let Ok(it) = self.current_storage_usage().await {
+                storage = Some(it)
+            };
+
+            if dpus.is_some() && storage.is_some() {
+                break;
+            }
+
+            // XXX: New clusters will always have metrics due to the initial table
+            // creation. Wait for them to come through.
+            println!("no metrics yet, assuming this is a new cluster, retrying..");
+            sleep(Duration::from_secs(30)).await;
+        }
+
+        let dpu_metrics = dpus.unwrap();
+        let storage_metrics = storage.unwrap();
+        let cost_estimate = calculate_costs(&dpu_metrics, &storage_metrics);
+        Ok(Usage {
+            dpu_metrics,
+            storage_metrics,
+            cost_estimate,
+        })
+    }
+
+    pub fn spawn_monitor(self, initial_usage: Usage) -> watch::Receiver<Usage> {
+        let calc = self;
+        let (tx, rx) = watch::channel(initial_usage);
+
+        tokio::spawn(async move {
+            loop {
+                if tx.receiver_count() == 0 {
+                    break;
+                }
+
+                if let Ok(it) = calc.dpus_this_month().await {
+                    tx.send_if_modified(move |usage| usage.set_dpu_metrics(it));
+                }
+
+                if let Ok(it) = calc.current_storage_usage().await {
+                    tx.send_if_modified(move |usage| usage.set_storage_metrics(it));
+                }
+
+                sleep(Duration::from_secs(30)).await;
+            }
+        });
+
+        rx
+    }
+}
+
+/// Print usage information to the console
+pub fn print(latest_usage: &Usage) {
+    let storage = byte_unit::Byte::from_u64(latest_usage.storage_metrics.size_bytes as u64)
+        .get_appropriate_unit(byte_unit::UnitType::Decimal);
+    let total_cost = latest_usage.cost_estimate.total_dpus.total
+        + latest_usage.cost_estimate.latest_storage.gb_month;
+
+    println!("\n{:=^70}", " Usage & Cost ");
+    println!("{:<15} {:>15} {:>15}", "", "Usage", "Cost");
+    println!("{:-<15} {:-^15} {:-^15}", "", "", "");
+    println!(
+        "{:<15} {:>15.2} {:>15}",
+        "Total DPUs:",
+        latest_usage.dpu_metrics.total,
+        format!("${:.2}", latest_usage.cost_estimate.total_dpus.total)
+    );
+    println!(
+        "{:<15} {:>15.2} {:>15}",
+        "  Compute:",
+        latest_usage.dpu_metrics.compute,
+        format!("${:.2}", latest_usage.cost_estimate.total_dpus.compute)
+    );
+    println!(
+        "{:<15} {:>15.2} {:>15}",
+        "  Read:",
+        latest_usage.dpu_metrics.read,
+        format!("${:.2}", latest_usage.cost_estimate.total_dpus.read)
+    );
+    println!(
+        "{:<15} {:>15.2} {:>15}",
+        "  Write:",
+        latest_usage.dpu_metrics.write,
+        format!("${:.2}", latest_usage.cost_estimate.total_dpus.write)
+    );
+    println!(
+        "{:<15} {:>15} {:>15}",
+        "Storage:",
+        storage.to_string(),
+        format!("${:.2}", latest_usage.cost_estimate.latest_storage.gb_month)
+    );
+    println!("{:═<15} {:═^15} {:═^15}", "", "", "");
+    println!(
+        "{:<15} {:>15} {:>15}",
+        "TOTAL COST:",
+        "",
+        format!("${:.2}", total_cost)
+    );
+    println!("{:=^70}", "");
+}
+
+/// Print usage information and difference to the console
+pub fn print_with_diff(latest_usage: &Usage, usage_diff: &Usage) {
+    let storage_current = byte_unit::Byte::from_u64(latest_usage.storage_metrics.size_bytes as u64)
+        .get_appropriate_unit(byte_unit::UnitType::Decimal);
+    let storage_diff = byte_unit::Byte::from_u64(usage_diff.storage_metrics.size_bytes as u64)
+        .get_appropriate_unit(byte_unit::UnitType::Decimal);
+
+    let total_cost_current = latest_usage.cost_estimate.total_dpus.total
+        + latest_usage.cost_estimate.latest_storage.gb_month;
+    let total_cost_diff = usage_diff.cost_estimate.total_dpus.total
+        + usage_diff.cost_estimate.latest_storage.gb_month;
+
+    println!("\n{:=^90}", " Usage & Cost ");
+    println!(
+        "{:<15} {:>15} {:>15} {:>15} {:>15}",
+        "", "Usage", "Delta", "Cost", "Delta"
+    );
+    println!(
+        "{:-<15} {:-^15} {:-^15} {:-^15} {:-^15}",
+        "", "", "", "", ""
+    );
+    println!(
+        "{:<15} {:>15.2} {:>15} {:>15} {:>15}",
+        "Total DPUs:",
+        latest_usage.dpu_metrics.total,
+        format!("(+{:.2})", usage_diff.dpu_metrics.total),
+        format!("${:.2}", latest_usage.cost_estimate.total_dpus.total),
+        format!("(+${:.2})", usage_diff.cost_estimate.total_dpus.total)
+    );
+    println!(
+        "{:<15} {:>15.2} {:>15} {:>15} {:>15}",
+        "  Compute:",
+        latest_usage.dpu_metrics.compute,
+        format!("(+{:.2})", usage_diff.dpu_metrics.compute),
+        format!("${:.2}", latest_usage.cost_estimate.total_dpus.compute),
+        format!("(+${:.2})", usage_diff.cost_estimate.total_dpus.compute)
+    );
+    println!(
+        "{:<15} {:>15.2} {:>15} {:>15} {:>15}",
+        "  Read:",
+        latest_usage.dpu_metrics.read,
+        format!("(+{:.2})", usage_diff.dpu_metrics.read),
+        format!("${:.2}", latest_usage.cost_estimate.total_dpus.read),
+        format!("(+${:.2})", usage_diff.cost_estimate.total_dpus.read)
+    );
+    println!(
+        "{:<15} {:>15.2} {:>15} {:>15} {:>15}",
+        "  Write:",
+        latest_usage.dpu_metrics.write,
+        format!("(+{:.2})", usage_diff.dpu_metrics.write),
+        format!("${:.2}", latest_usage.cost_estimate.total_dpus.write),
+        format!("(+${:.2})", usage_diff.cost_estimate.total_dpus.write)
+    );
+    println!(
+        "{:<15} {:>15} {:>15} {:>15} {:>15}",
+        "Storage:",
+        storage_current.to_string(),
+        format!("(+{})", storage_diff),
+        format!("${:.2}", latest_usage.cost_estimate.latest_storage.gb_month),
+        format!(
+            "(+${:.2})",
+            usage_diff.cost_estimate.latest_storage.gb_month
+        )
+    );
+    println!(
+        "{:═<15} {:═^15} {:═^15} {:═^15} {:═^15}",
+        "", "", "", "", ""
+    );
+    println!(
+        "{:<15} {:>15} {:>15} {:>15} {:>15}",
+        "TOTAL COST:",
+        "",
+        "",
+        format!("${:.2}", total_cost_current),
+        format!("(+${:.2})", total_cost_diff)
+    );
+    println!("{:=^90}", "");
 }
 
 pub fn calculate_costs(dpu_metrics: &DpuMetrics, storage_info: &StorageMetrics) -> CostEstimate {

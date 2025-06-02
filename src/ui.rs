@@ -1,15 +1,17 @@
-use anyhow::Result;
-use byte_unit::Byte;
-use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-    ExecutableCommand,
-};
-use ratatui::prelude::*;
 use std::io::stdout;
 use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use crossterm::{
+    ExecutableCommand,
+    event::{self, Event, KeyCode, KeyModifiers},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::prelude::*;
+use tokio::sync::mpsc;
 use tokio::time;
 
+use crate::events::{EventListener, Message};
 use crate::runner::WorkloadRunner;
 use crate::tui::{self, Model};
 
@@ -18,111 +20,151 @@ enum AppState {
     Running,
     Stopping,
     WaitingForFinalStats,
+    EditingWorkload,
 }
 
 pub struct MonitorUI {
     terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
+    listener: EventListener,
 }
 
 impl MonitorUI {
-    pub fn new() -> Result<Self> {
+    pub fn new(rx: mpsc::Receiver<Message>) -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = stdout();
         stdout.execute(EnterAlternateScreen)?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
-        
-        Ok(Self { terminal })
+        let listener = EventListener::new(rx);
+
+        Ok(Self { terminal, listener })
     }
 
-    pub async fn run(&mut self, runner: &WorkloadRunner) -> Result<()> {
+    pub async fn run(&mut self, runner: WorkloadRunner) -> Result<()> {
         let mut interval = time::interval(Duration::from_secs(1));
-        let interval_secs = 1.0;
 
-        let mut model = Model::new(runner.metrics.total_batches);
-        let mut prev_usage = (*runner.usage_rx.borrow()).clone();
+        // Setup state
+        let mut model = Model::new(runner);
+        let running = model.runner.spawn();
         let mut app_state = AppState::Running;
-        let mut load_gen_stopped = false;
         let mut final_stats_start: Option<Instant> = None;
 
         loop {
-            // Check for quit key
+            // Check for key events
             if event::poll(Duration::from_millis(0))? {
                 if let Event::Key(key) = event::read()? {
-                    // Handle quit keys: 'q', ESC, or Ctrl-C
-                    let should_quit = key.code == KeyCode::Char('q') 
-                        || key.code == KeyCode::Esc
-                        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
-                    
-                    if should_quit {
-                        match app_state {
-                            AppState::Running => {
-                                // First quit: stop the load generator but keep TUI running
-                                app_state = AppState::Stopping;
-                                runner.stop_workload();
-                                load_gen_stopped = true;
+                    match app_state {
+                        AppState::EditingWorkload => {
+                            // Handle workload modal keyboard input
+                            match key.code {
+                                KeyCode::Esc => {
+                                    // Cancel editing and close modal
+                                    model.workload_modal_state.hide();
+                                    app_state = AppState::Running;
+                                }
+                                KeyCode::Enter => {
+                                    if model.workload_modal_state.editing {
+                                        // Apply the current edit
+                                        model.workload_modal_state.apply_edit();
+                                    } else {
+                                        // Save changes and close modal
+                                        let new_total_batches =
+                                            model.workload_modal_state.total_batches;
+
+                                        // Update runner parameters if they've changed
+                                        if model.runner.batches() != new_total_batches {
+                                            model.runner.set_batches(new_total_batches);
+                                        }
+
+                                        // Note: concurrency and rows_per_transaction would be used here
+                                        // to update the workload runner if changing mid-execution was supported
+
+                                        // Close modal and return to running state
+                                        model.workload_modal_state.hide();
+                                        app_state = AppState::Running;
+                                    }
+                                }
+                                KeyCode::Tab => {
+                                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                        // Go to previous field
+                                        model.workload_modal_state.previous_field();
+                                    } else {
+                                        // Go to next field
+                                        model.workload_modal_state.next_field();
+                                    }
+                                }
+                                KeyCode::Char(c)
+                                    if c.is_ascii_digit() && model.workload_modal_state.editing =>
+                                {
+                                    // Add digit to buffer
+                                    model.workload_modal_state.buffer.push(c);
+                                }
+                                KeyCode::Backspace if model.workload_modal_state.editing => {
+                                    // Remove last character from buffer
+                                    model.workload_modal_state.buffer.pop();
+                                }
+                                KeyCode::Char(' ') if !model.workload_modal_state.editing => {
+                                    // Space to start editing the current field
+                                    model.workload_modal_state.start_editing();
+                                }
+                                _ => {}
                             }
-                            AppState::Stopping | AppState::WaitingForFinalStats => {
-                                // Second quit: exit immediately
-                                break;
+                        }
+                        _ => {
+                            // Handle normal mode keyboard input
+                            match key.code {
+                                KeyCode::Char('w') if app_state == AppState::Running => {
+                                    // Show workload settings modal
+                                    model.workload_modal_state.show();
+                                    app_state = AppState::EditingWorkload;
+                                }
+                                _ => {
+                                    // Handle quit keys: 'q', ESC, or Ctrl-C
+                                    let should_quit = key.code == KeyCode::Char('q')
+                                        || key.code == KeyCode::Esc
+                                        || (key.code == KeyCode::Char('c')
+                                            && key.modifiers.contains(KeyModifiers::CONTROL));
+
+                                    if should_quit {
+                                        match app_state {
+                                            AppState::Running => {
+                                                // First quit: stop the load generator but keep TUI running
+                                                app_state = AppState::Stopping;
+                                                running.abort();
+                                            }
+                                            AppState::Stopping | AppState::WaitingForFinalStats => {
+                                                // Second quit: exit immediately
+                                                break;
+                                            }
+                                            AppState::EditingWorkload => {
+                                                // If in workload editing mode, just close the modal and return to running state
+                                                model.workload_modal_state.hide();
+                                                app_state = AppState::Running;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
 
+            // Wait for tick
             interval.tick().await;
 
-            // Only get metrics if load gen is still running
-            if !load_gen_stopped {
-                // Get TPS and reset counter
-                let (completed, errors, latency_histogram) = runner.metrics.get_and_reset();
-                let tps = completed as f64 / interval_secs;
-                let eps = errors as f64 / interval_secs; // errors per second
-                
-                // Update model with new data
-                model.metrics = runner.metrics.read();
-                model.progress_pct = (model.metrics.completed_batches as f64 / model.total_batches as f64) * 100.0;
-                
-                // Calculate performance metrics
-                let rps = tps * runner.workload.rows_inserted as f64;
-                let bps = (rps * runner.workload.per_row_logical_bytes_written as f64) as u64;
-                let bps_formatted = Byte::from_u64(bps).get_appropriate_unit(byte_unit::UnitType::Binary);
-                let bps_formatted_str = format!("{:.2} {}/sec", bps_formatted.get_value(), bps_formatted.get_unit());
-                let pool_size = runner.pool.size() as usize;
-                let pool_idle = runner.pool.num_idle() as usize;
-                
-                // Update widget states
-                model.performance_state.update(tps, rps, bps_formatted_str, pool_size, pool_idle);
-                model.latency_state.update(latency_histogram);
-                model.error_state.update(eps);
-            } else {
-                // Load gen stopped, but keep updating usage stats
-                model.metrics = runner.metrics.read();
-            }
+            // Process available events
+            self.listener.process_available_messages(&mut model).await;
 
-            model.latest_usage = runner.usage_rx.borrow().clone();
-            model.usage_diff = if runner.usage_rx.has_changed().unwrap() {
-                let diff = model.latest_usage.clone() - prev_usage.clone();
-                prev_usage = model.latest_usage.clone();
-                diff
-            } else {
-                model.latest_usage.clone() - model.latest_usage.clone() // Zero diff
-            };
-            model.usage_diff_from_start = model.latest_usage.clone() - runner.initial_usage.clone();
-
-            // Update app state based on completion
-            if !load_gen_stopped && model.metrics.completed_batches >= model.total_batches {
-                // Load gen completed naturally
-                load_gen_stopped = true;
-                app_state = AppState::WaitingForFinalStats;
-                final_stats_start = Some(Instant::now());
-            } else if load_gen_stopped && app_state == AppState::Stopping {
-                // Transition to waiting for final stats
+            // Load gen stopped check based on events and completion
+            if running.is_finished()
+                && (self.listener.completed
+                    || model.metrics.completed_batches >= model.runner.batches())
+            {
                 app_state = AppState::WaitingForFinalStats;
                 final_stats_start = Some(Instant::now());
             }
-            
+
             // Check if final stats collection has timed out (after 2 minutes)
             if let Some(start_time) = final_stats_start {
                 if start_time.elapsed() > Duration::from_secs(120) {
@@ -131,17 +173,23 @@ impl MonitorUI {
                 }
             }
 
-            // Draw UI using the new component architecture
+            // Draw UI using the component architecture
             self.terminal.draw(|f| {
                 tui::draw(f, &model);
-                
+
                 // Show stopping state overlay
                 match app_state {
                     AppState::Stopping => {
-                        let stopping_msg = ratatui::widgets::Paragraph::new("Stopping load generator... Press quit again to exit immediately.")
-                            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-                            .alignment(ratatui::layout::Alignment::Center);
-                        
+                        let stopping_msg = ratatui::widgets::Paragraph::new(
+                            "Stopping load generator... Press quit again to exit immediately.",
+                        )
+                        .style(
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                        .alignment(ratatui::layout::Alignment::Center);
+
                         // Render at the very bottom (below quit message)
                         let area = f.area();
                         let stopping_area = ratatui::layout::Rect {
@@ -153,10 +201,16 @@ impl MonitorUI {
                         f.render_widget(stopping_msg, stopping_area);
                     }
                     AppState::WaitingForFinalStats => {
-                        let waiting_msg = ratatui::widgets::Paragraph::new("Collecting final usage stats... Press quit to exit.")
-                            .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-                            .alignment(ratatui::layout::Alignment::Center);
-                        
+                        let waiting_msg = ratatui::widgets::Paragraph::new(
+                            "Collecting final usage stats... Press quit to exit.",
+                        )
+                        .style(
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                        .alignment(ratatui::layout::Alignment::Center);
+
                         // Render at the very bottom (below quit message)
                         let area = f.area();
                         let waiting_area = ratatui::layout::Rect {
@@ -169,6 +223,9 @@ impl MonitorUI {
                     }
                     AppState::Running => {
                         // No overlay needed for running state
+                    }
+                    AppState::EditingWorkload => {
+                        // The workload modal is rendered separately in tui::draw
                     }
                 }
             })?;

@@ -24,7 +24,7 @@ pub fn load_all(n: usize) -> HashMap<String, Workload> {
 
 pub fn tiny_rows(n: usize) -> Workload {
     Workload {
-        name: format!("tiny"),
+        name: "tiny".to_string(),
         setup: "CREATE TABLE IF NOT EXISTS test (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     content text
@@ -40,14 +40,15 @@ pub fn tiny_rows(n: usize) -> Workload {
 
 pub fn one_kib_rows(n: usize) -> Workload {
     Workload {
-        name: format!("1KiB"),
+        name: "1KiB".to_string(),
         setup: "CREATE TABLE IF NOT EXISTS test (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     content text
 );"
         .to_string(),
-        single_statement:
-            format!("INSERT INTO test (content) SELECT substring(repeat(md5(random()::text), 32), 1, 988) FROM generate_series(1, {n})"),
+        single_statement: format!(
+            "INSERT INTO test (content) SELECT substring(repeat(md5(random()::text), 32), 1, 988) FROM generate_series(1, {n})"
+        ),
         rows_inserted: n,
         per_row_logical_bytes_written: 1024,
     }

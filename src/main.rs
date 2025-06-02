@@ -1,11 +1,20 @@
+use std::fs::File;
+use std::time::Duration;
+
 use anyhow::{anyhow, Result};
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use clap::Parser;
-use dsql_gen::runner::{WorkloadRunner, print_usage, print_usage_and_diff};
+use dsql_gen::events::Message;
+use tokio::sync::mpsc;
+use tokio::task::{self, JoinHandle};
+
+use dsql_gen::runner::WorkloadRunner;
 use dsql_gen::ui::MonitorUI;
 use dsql_gen::usage::{self, Usage, UsageCalculator};
-use tokio::sync::mpsc;
-use tokio::task;
+use tokio::time::sleep;
+use tracing::Level;
+use tracing_appender::non_blocking::NonBlocking;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -34,7 +43,7 @@ struct RunArgs {
 
     /// Number of concurrent connections
     #[arg(short, long, default_value_t = 10)]
-    concurrency: u32,
+    concurrency: usize,
 
     /// Total number of batches to execute
     #[arg(short, long, default_value_t = 2000)]
@@ -99,62 +108,56 @@ async fn run_load_generator(args: RunArgs) -> Result<()> {
         return Ok(());
     }
 
+    let (tx, rx) = mpsc::channel(1000);
+
+    let calc = UsageCalculator::new(args.identifier.clone(), &sdk_config);
+
     // Create the workload runner
     let runner = WorkloadRunner::new(
-        args.identifier.clone(),
         args.endpoint(&sdk_config)?,
         sdk_config,
         args.workload,
         args.rows,
         args.concurrency,
         args.batches,
+        tx.clone(),
     )
     .await?;
 
-    print_usage(&runner.initial_usage);
+    // make sure this is after the setup runs.
+    let initial_usage = calc.get_initial_usage().await?;
+    usage::print(&initial_usage);
+    let watch_usage = calc.spawn_monitor(initial_usage);
 
-    // Create channels for coordination
-    let (ui_done_tx, mut ui_done_rx) = mpsc::channel::<()>(1);
-    let (workload_done_tx, mut workload_done_rx) = mpsc::channel::<()>(1);
-
-    // Start the workload in a separate task
-    let runner_clone = runner.clone();
-    let concurrency = args.concurrency;
-    let batches = args.batches;
-    let workload_handle = task::spawn(async move {
-        runner_clone.run(concurrency, batches).await?;
-        let _ = workload_done_tx.send(()).await;
-        Ok::<(), anyhow::Error>(())
+    // notify the UI of usage updates.
+    let tx_usage = tx.clone();
+    let mut _watch_usage = watch_usage.clone();
+    tx_usage.send(Message::InitialUsage(initial_usage)).await?;
+    let _send_usage: JoinHandle<Result<()>> = tokio::spawn(async move {
+        loop {
+            _watch_usage.changed().await?;
+            let usage = *_watch_usage.borrow();
+            tx_usage.send(Message::UsageUpdated(usage)).await?;
+        }
     });
 
     // Start the UI in a separate task
-    let runner_clone = runner.clone();
-    let ui_handle = task::spawn(async move {
-        let mut ui = MonitorUI::new()?;
-        ui.run(&runner_clone).await?;
-        let _ = ui_done_tx.send(()).await;
-        Ok::<(), anyhow::Error>(())
+    let ui = task::spawn(async move {
+        let mut ui = MonitorUI::new(rx)?;
+        ui.run(runner).await?;
+        anyhow::Ok(())
     });
 
-    // Wait for either the workload to complete or the UI to be closed
-    tokio::select! {
-        _ = ui_done_rx.recv() => {
-            // UI was closed, abort the workload
-            workload_handle.abort();
-        }
-        _ = workload_done_rx.recv() => {
-            // Workload completed normally
-        }
+    if let Err(err) = ui.await? {
+        eprintln!("{err:?}");
     }
 
-    // Wait for the UI to close if it hasn't already
-    let _ = ui_handle.await;
+    println!("waiting for final usage");
+    sleep(Duration::from_secs(90)).await;
+    let final_usage = *watch_usage.borrow();
 
-    // Cleanup and get final usage
-    let (initial_usage, final_usage) = runner.cleanup().await?;
-    
     let usage_diff = final_usage - initial_usage;
-    print_usage_and_diff(&final_usage, &usage_diff);
+    usage::print_with_diff(&final_usage, &usage_diff);
 
     Ok(())
 }
@@ -177,13 +180,25 @@ async fn print_cluster_usage(args: UsageArgs) -> anyhow::Result<()> {
         cost_estimate,
     };
 
-    print_usage(&usage);
+    usage::print(&usage);
 
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let file = File::create("/tmp/dsql-gen.log")?;
+    let (non_blocking, _guard) = NonBlocking::new(file);
+
+    let env_filter = EnvFilter::builder()
+        .with_default_directive(Level::INFO.into())
+        .from_env_lossy();
+
+    tracing_subscriber::fmt()
+        .with_writer(non_blocking)
+        .with_env_filter(env_filter)
+        .init();
+
     let args = Args::parse();
 
     match args.command {

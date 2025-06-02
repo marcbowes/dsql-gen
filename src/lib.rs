@@ -1,3 +1,4 @@
+pub mod events;
 pub mod history;
 pub mod runner;
 pub mod tui;
