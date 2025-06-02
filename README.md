@@ -1,40 +1,73 @@
 # DSQL data generator tool
 
-A simple Rust program to insert rows into an AWS DSQL table with configurable
-concurrency and automatic retry on failures.
+A Rust load generator for AWS DSQL with a terminal UI for real-time monitoring. Features configurable workloads, automatic retry on failures, and usage tracking.
+
+## Features
+
+- **Terminal UI**: Real-time monitoring with ratatui showing:
+  - Progress bar with completion percentage
+  - Performance metrics (TPS, rows/sec, throughput)
+  - Latency statistics (p50, p90, p99, p99.9)
+  - DPU usage and cost tracking
+  - Error monitoring
+- **Configurable workloads**: Multiple pre-defined workloads
+- **Automatic retry**: Built-in retry logic with exponential backoff
+- **Connection pooling**: Efficient connection management
+- **Usage tracking**: Monitor DPU consumption and storage costs
 
 ## Usage
 
 ```bash
-# Run with default settings (2000 batches, 10 concurrent connections)
-cargo run --release -- --endpoint your-cluster-endpoint.amazonaws.com
+# Run a workload
+cargo run --release -- run \
+  --identifier your-cluster-id \
+  --workload workload-name \
+  --rows number-of-rows
 
-# Run with custom settings
-cargo run --release -- \
-  --endpoint your-cluster-endpoint.amazonaws.com \
-  --region the-region \
-  --concurrency 20 \
-  --batches 2000 \
-  --sql "INSERT INTO test (content) SELECT md5(random()::text) FROM generate_series(1, 1000)"
+# Check cluster usage
+cargo run --release -- usage \
+  --identifier your-cluster-id
 
 # Get help
 cargo run --release -- --help
+cargo run --release -- run --help
+cargo run --release -- usage --help
 ```
 
 ## Examples
 
 ```bash
-# Insert 2 million rows into test table (default)
-cargo run --release -- --endpoint my-cluster.dsql.us-east-1.on.aws
+# Run default workload (2000 batches, 10 concurrent connections)
+cargo run --release -- run \
+  --identifier my-cluster \
+  --workload default \
+  --rows 1000
 
-# Insert 5 million rows with 50 concurrent connections
-cargo run --release -- \
-  --endpoint my-cluster.dsql.us-east-1.on.aws \
-  --concurrency 50 \
+# Run with custom settings
+cargo run --release -- run \
+  --identifier my-cluster \
+  --workload heavy-write \
+  --rows 5000 \
+  --concurrency 20 \
   --batches 5000
 
-# Custom SQL with 100 rows per batch, 10k total rows
-cargo run --release -- \
-  --endpoint my-cluster.dsql.us-east-1.on.aws \
-  --sql "INSERT INTO users (name) SELECT 'user_' || generate_series(1, 100)" \
-  --batches 100
+# Check usage for a cluster
+cargo run --release -- usage \
+  --identifier my-cluster
+```
+
+## Terminal UI
+
+During workload execution, the terminal displays a real-time dashboard. Press `q` or `ESC` to gracefully stop the workload.
+
+```
+┌─ Progress ─────────────────────────────────┐
+│ ████████████████░░░░░░  1250/2000 (62.5%) │
+└────────────────────────────────────────────┘
+┌─ Performance ──────────────────────────────┐
+│ Transactions/sec: 125                      │
+│ Rows/sec: 1250                             │
+│ Throughput: 12.5 MiB/sec                   │
+│ Pool: 10 open, 2 idle                      │
+└────────────────────────────────────────────┘
+```
