@@ -3,14 +3,13 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
+use crate::runner::WorkloadRunner;
+
 /// Modal state to track which field is active and the form values
 #[derive(Clone, Debug)]
 pub struct WorkloadModalState {
     pub visible: bool,
-    pub total_batches: usize,
-    pub concurrency: u32,
-    pub rows_per_transaction: usize,
-    pub active_field: usize, // 0: batches, 1: concurrency, 2: rows
+    pub active_field: usize, // 0: batches, 1: concurrency
     pub editing: bool,       // Whether we're currently editing the active field
     pub buffer: String,      // Buffer for the field currently being edited
 }
@@ -25,9 +24,6 @@ impl WorkloadModalState {
     pub fn new() -> Self {
         Self {
             visible: false,
-            total_batches: 100,
-            concurrency: 10,
-            rows_per_transaction: 1000,
             active_field: 0,
             editing: false,
             buffer: String::new(),
@@ -35,32 +31,22 @@ impl WorkloadModalState {
     }
 
     /// Initialize the buffer with the current value of the active field
-    pub fn start_editing(&mut self) {
+    pub fn start_editing(&mut self, value: String) {
         self.editing = true;
-        self.buffer = match self.active_field {
-            0 => self.total_batches.to_string(),
-            1 => self.concurrency.to_string(),
-            2 => self.rows_per_transaction.to_string(),
-            _ => String::new(),
-        };
+        self.buffer = value;
     }
 
     /// Apply the buffer value to the active field
-    pub fn apply_edit(&mut self) {
+    pub fn apply_edit(&mut self, runner: &mut WorkloadRunner) {
         match self.active_field {
             0 => {
                 if let Ok(val) = self.buffer.parse() {
-                    self.total_batches = val;
+                    runner.set_batches(val);
                 }
             }
             1 => {
-                if let Ok(val) = self.buffer.parse::<u32>() {
-                    self.concurrency = val;
-                }
-            }
-            2 => {
                 if let Ok(val) = self.buffer.parse() {
-                    self.rows_per_transaction = val;
+                    runner.set_concurrency(val);
                 }
             }
             _ => {}
@@ -77,25 +63,22 @@ impl WorkloadModalState {
 
     /// Navigate to the previous field
     pub fn previous_field(&mut self) {
-        if self.active_field > 0 {
-            self.active_field -= 1;
-        } else {
-            self.active_field = 2; // Wrap around to last field
-        }
+        _ = self.active_field.saturating_sub(1);
     }
 
     /// Navigate to the next field
     pub fn next_field(&mut self) {
-        self.active_field = (self.active_field + 1) % 3;
+        self.active_field += 1;
+        if self.active_field > 2 {
+            self.active_field = 0;
+        }
     }
 
-    /// Get the current value of the specified field as a string
-    pub fn field_value(&self, field_index: usize) -> String {
+    pub fn field_value(&self, field_index: usize, runner: &WorkloadRunner) -> String {
         match field_index {
-            0 => self.total_batches.to_string(),
-            1 => self.concurrency.to_string(),
-            2 => self.rows_per_transaction.to_string(),
-            _ => String::new(),
+            0 => runner.batches().to_string(),
+            1 => runner.concurrency().to_string(),
+            _ => unreachable!(),
         }
     }
 
@@ -122,7 +105,7 @@ impl<'a> WorkloadModalWidget<'a> {
         Self { state }
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+    pub fn render(self, area: Rect, buf: &mut Buffer, runner: &WorkloadRunner) {
         // Only render if visible
         if !self.state.visible {
             return;
@@ -166,18 +149,14 @@ impl<'a> WorkloadModalWidget<'a> {
             .constraints([
                 Constraint::Length(2), // Total batches
                 Constraint::Length(2), // Concurrency
-                Constraint::Length(2), // Rows per transaction
                 Constraint::Length(1), // Spacer
                 Constraint::Length(1), // Controls hint
             ])
             .split(inner);
 
         // Render the fields
-        self.render_field("Total batches:", 0, field_areas[0], buf);
-
-        self.render_field("Concurrency:", 1, field_areas[1], buf);
-
-        self.render_field("Rows per transaction:", 2, field_areas[2], buf);
+        self.render_field("Total batches:", 0, field_areas[0], buf, runner);
+        self.render_field("Concurrency:", 1, field_areas[1], buf, runner);
 
         // Render controls hint
         let controls = "Tab: Next | Shift+Tab: Previous | Enter: Save | Esc: Cancel";
@@ -185,10 +164,17 @@ impl<'a> WorkloadModalWidget<'a> {
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::Gray));
 
-        controls_para.render(field_areas[4], buf);
+        controls_para.render(field_areas[3], buf);
     }
 
-    fn render_field(&self, label: &str, field_index: usize, area: Rect, buf: &mut Buffer) {
+    fn render_field(
+        &self,
+        label: &str,
+        field_index: usize,
+        area: Rect,
+        buf: &mut Buffer,
+        runner: &WorkloadRunner,
+    ) {
         // Split the area into label and value
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
@@ -206,7 +192,7 @@ impl<'a> WorkloadModalWidget<'a> {
         let display_value = if self.state.editing && self.state.active_field == field_index {
             self.state.buffer.clone()
         } else {
-            self.state.field_value(field_index)
+            self.state.field_value(field_index, runner)
         };
 
         // Determine style based on whether this field is active

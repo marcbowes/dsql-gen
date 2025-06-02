@@ -3,9 +3,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::{
-    ExecutableCommand,
     event::{self, Event, KeyCode, KeyModifiers},
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    ExecutableCommand,
 };
 use ratatui::prelude::*;
 use tokio::sync::mpsc;
@@ -58,30 +58,16 @@ impl MonitorUI {
                             // Handle workload modal keyboard input
                             match key.code {
                                 KeyCode::Esc => {
-                                    // Cancel editing and close modal
-                                    model.workload_modal_state.hide();
+                                    if model.workload_modal_state.visible {
+                                        model.workload_modal_state.hide();
+                                    }
                                     app_state = AppState::Running;
                                 }
                                 KeyCode::Enter => {
                                     if model.workload_modal_state.editing {
                                         // Apply the current edit
-                                        model.workload_modal_state.apply_edit();
-                                    } else {
-                                        // Save changes and close modal
-                                        let new_total_batches =
-                                            model.workload_modal_state.total_batches;
-
-                                        // Update runner parameters if they've changed
-                                        if model.runner.batches() != new_total_batches {
-                                            model.runner.set_batches(new_total_batches);
-                                        }
-
-                                        // Note: concurrency and rows_per_transaction would be used here
-                                        // to update the workload runner if changing mid-execution was supported
-
-                                        // Close modal and return to running state
+                                        model.workload_modal_state.apply_edit(&mut model.runner);
                                         model.workload_modal_state.hide();
-                                        app_state = AppState::Running;
                                     }
                                 }
                                 KeyCode::Tab => {
@@ -93,19 +79,15 @@ impl MonitorUI {
                                         model.workload_modal_state.next_field();
                                     }
                                 }
-                                KeyCode::Char(c)
-                                    if c.is_ascii_digit() && model.workload_modal_state.editing =>
-                                {
-                                    // Add digit to buffer
+                                KeyCode::Char(c) if c.is_ascii_digit() => {
+                                    if !model.workload_modal_state.editing {
+                                        model.workload_modal_state.start_editing(String::new());
+                                    }
                                     model.workload_modal_state.buffer.push(c);
                                 }
                                 KeyCode::Backspace if model.workload_modal_state.editing => {
                                     // Remove last character from buffer
                                     model.workload_modal_state.buffer.pop();
-                                }
-                                KeyCode::Char(' ') if !model.workload_modal_state.editing => {
-                                    // Space to start editing the current field
-                                    model.workload_modal_state.start_editing();
                                 }
                                 _ => {}
                             }

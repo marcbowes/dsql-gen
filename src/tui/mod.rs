@@ -194,6 +194,6 @@ pub fn draw(f: &mut Frame, model: &Model) {
     // Render the workload modal if visible
     if model.workload_modal_state.visible {
         let workload_modal = WorkloadModalWidget::new(&model.workload_modal_state);
-        workload_modal.render(f.area(), f.buffer_mut());
+        workload_modal.render(f.area(), f.buffer_mut(), &model.runner);
     }
 }
