@@ -181,7 +181,7 @@ pub fn draw(f: &mut Frame, model: &Model) {
 
     // Render quit message at the bottom without borders
     let quit_msg = ratatui::widgets::Paragraph::new(
-        "Press 'q' or ESC to quit | Press 'w' for workload settings",
+        "Press 'q' or ESC to quit", // | Press 'w' for workload settings
     )
     .style(
         Style::default()
