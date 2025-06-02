@@ -112,6 +112,7 @@ impl<'a> Widget for UsageCostWidget<'a> {
                 Cell::from(""),
                 Cell::from(format!("(+${:.2})", total_cost_diff)).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             ]),
+
         ];
         
         let title = if m.completed_batches >= self.model.total_batches {

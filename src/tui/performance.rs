@@ -5,46 +5,54 @@ use ratatui::{
     symbols,
     widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph},
 };
+use std::time::Duration;
 
-use crate::tui::Model;
+use crate::history::{bucketing::{bucket_data, BucketConfig}, TimestampedHistory};
 
-/// Widget for displaying performance statistics
+/// State for the performance widget containing its history data
+#[derive(Clone)]
+pub struct PerformanceState {
+    pub tps: f64,
+    pub rps: f64,
+    pub bps_formatted: String,
+    pub pool_size: usize,
+    pub pool_idle: usize,
+    pub tps_history: TimestampedHistory<f64>,
+}
+
+impl PerformanceState {
+    /// Create a new performance state with default values
+    pub fn new() -> Self {
+        Self {
+            tps: 0.0,
+            rps: 0.0,
+            bps_formatted: "0 B".to_string(),
+            pool_size: 0,
+            pool_idle: 0,
+            tps_history: TimestampedHistory::new(Duration::from_secs(300)),
+        }
+    }
+    
+    /// Update the performance state with new data
+    pub fn update(&mut self, tps: f64, rps: f64, bps_formatted: String, pool_size: usize, pool_idle: usize) {
+        self.tps = tps;
+        self.rps = rps;
+        self.bps_formatted = bps_formatted;
+        self.pool_size = pool_size;
+        self.pool_idle = pool_idle;
+        self.tps_history.push(tps);
+    }
+}
+
+/// Stateful performance widget that can render both simple stats and charts
 pub struct PerformanceWidget<'a> {
-    model: &'a Model,
+    state: &'a PerformanceState,
 }
 
 impl<'a> PerformanceWidget<'a> {
-    /// Create a new performance widget with the given model
-    pub fn new(model: &'a Model) -> Self {
-        Self { model }
-    }
-}
-
-impl<'a> Widget for PerformanceWidget<'a> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let throughput_text = vec![
-            format!("Transactions/sec: {}", self.model.tps as u64),
-            format!("Rows/sec: {}", self.model.rps as u64),
-            format!("Throughput: {}", self.model.bps_formatted),
-            format!("Pool: {} open, {} idle", self.model.pool_size, self.model.pool_idle),
-        ].join("\n");
-        
-        let throughput_para = Paragraph::new(throughput_text)
-            .block(Block::default().title("Performance").borders(Borders::ALL));
-        
-        throughput_para.render(area, buf);
-    }
-}
-
-/// Placeholder for future stateful performance widget with chart
-pub struct StatefulPerformanceWidget<'a> {
-    model: &'a Model,
-}
-
-impl<'a> StatefulPerformanceWidget<'a> {
-    /// Create a new stateful performance widget
-    pub fn new(model: &'a Model) -> Self {
-        Self { model }
+    /// Create a new performance widget with the given state
+    pub fn new(state: &'a PerformanceState) -> Self {
+        Self { state }
     }
     
     /// Render with split layout for chart integration
@@ -67,10 +75,10 @@ impl<'a> StatefulPerformanceWidget<'a> {
     
     fn render_stats(&self, area: Rect, buf: &mut Buffer) {
         let throughput_text = vec![
-            format!("Transactions/sec: {}", self.model.tps as u64),
-            format!("Rows/sec: {}", self.model.rps as u64),
-            format!("Throughput: {}", self.model.bps_formatted),
-            format!("Pool: {} open, {} idle", self.model.pool_size, self.model.pool_idle),
+            format!("Transactions/sec: {}", self.state.tps as u64),
+            format!("Rows/sec: {}", self.state.rps as u64),
+            format!("Throughput: {}", self.state.bps_formatted),
+            format!("Pool: {} open, {} idle", self.state.pool_size, self.state.pool_idle),
         ].join("\n");
         
         let throughput_para = Paragraph::new(throughput_text)
@@ -80,7 +88,7 @@ impl<'a> StatefulPerformanceWidget<'a> {
     }
     
     fn render_chart(&self, area: Rect, buf: &mut Buffer) {
-        if self.model.tps_history.is_empty() {
+        if self.state.tps_history.is_empty() {
             // No data yet, just render empty block
             let block = Block::default()
                 .title("TPS Chart (5 min)")
@@ -89,12 +97,27 @@ impl<'a> StatefulPerformanceWidget<'a> {
             return;
         }
 
+        // Use bucketing to convert timestamped data to chart data
+        let config = BucketConfig::new(Duration::from_secs(1), 300); // 300 seconds = 5 minutes
+        let buckets = bucket_data(
+            self.state.tps_history.data(),
+            config,
+            |values| {
+                // Average the values in each bucket
+                if values.is_empty() {
+                    0.0
+                } else {
+                    values.iter().map(|&&v| v).sum::<f64>() / values.len() as f64
+                }
+            },
+            0.0, // default value for empty buckets
+        );
+
         // Prepare data for chart
-        let data_len = self.model.tps_history.len();
-        let mut tps_data = Vec::with_capacity(data_len);
+        let mut tps_data = Vec::with_capacity(buckets.len());
         let mut max_tps: f64 = 0.0;
         
-        for (i, &tps) in self.model.tps_history.iter().enumerate() {
+        for (i, &tps) in buckets.iter().enumerate() {
             let x = i as f64;
             tps_data.push((x, tps));
             max_tps = max_tps.max(tps);
@@ -152,5 +175,11 @@ impl<'a> StatefulPerformanceWidget<'a> {
             .hidden_legend_constraints((Constraint::Percentage(50), Constraint::Percentage(50)));
         
         chart.render(area, buf);
+    }
+}
+
+impl<'a> Widget for PerformanceWidget<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        self.render_stats(area, buf);
     }
 }

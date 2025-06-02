@@ -3,9 +3,6 @@
 //! This module contains all the UI components for the terminal user interface,
 //! organized as separate modules for each section of the UI.
 
-use std::collections::VecDeque;
-
-use hdrhistogram::Histogram;
 use ratatui::prelude::*;
 
 pub mod errors;
@@ -14,9 +11,9 @@ pub mod performance;
 pub mod progress;
 pub mod usage_cost;
 
-use errors::StatefulErrorWidget;
-use latency::StatefulLatencyWidget;
-use performance::StatefulPerformanceWidget;
+use errors::{ErrorWidget, ErrorState};
+use latency::{LatencyWidget, LatencyState};
+use performance::{PerformanceWidget, PerformanceState};
 use progress::ProgressWidget;
 use usage_cost::UsageCostWidget;
 
@@ -29,18 +26,12 @@ pub struct Model {
     pub metrics: MetricsInner,
     pub total_batches: usize,
     pub progress_pct: f64,
-    pub tps: f64,
-    pub rps: f64,
-    pub bps_formatted: String,
-    pub pool_size: usize,
-    pub pool_idle: usize,
-    pub latest_latency_histogram: Histogram<u64>,
     pub latest_usage: Usage,
     pub usage_diff: Usage,
     pub usage_diff_from_start: Usage,
-    pub tps_history: VecDeque<f64>,
-    pub latency_histogram_history: VecDeque<Histogram<u64>>, // Store full histograms
-    pub error_history: VecDeque<f64>,                        // errors per second
+    pub latency_state: LatencyState,
+    pub performance_state: PerformanceState,
+    pub error_state: ErrorState,
 }
 
 impl Model {
@@ -50,18 +41,12 @@ impl Model {
             metrics: MetricsInner::default(),
             total_batches,
             progress_pct: 0.0,
-            tps: 0.0,
-            rps: 0.0,
-            bps_formatted: "0 B".to_string(),
-            pool_size: 0,
-            pool_idle: 0,
-            latest_latency_histogram: Histogram::<u64>::new_with_bounds(1, 60_000 * 10, 3).unwrap(),
             latest_usage: Usage::default(),
             usage_diff: Usage::default(),
             usage_diff_from_start: Usage::default(),
-            tps_history: VecDeque::with_capacity(300), // 5 minutes at 1s intervals
-            latency_histogram_history: VecDeque::with_capacity(300),
-            error_history: VecDeque::with_capacity(300),
+            latency_state: LatencyState::new(),
+            performance_state: PerformanceState::new(),
+            error_state: ErrorState::new(),
         }
     }
 }
@@ -70,7 +55,7 @@ impl Model {
 pub fn draw(f: &mut Frame, model: &Model) {
     // Calculate available height after fixed sections
     let total_height = f.area().height.saturating_sub(2); // Account for margin
-    let fixed_height = 3 + 12 + 12; // Progress + Errors + Usage & Cost
+    let fixed_height = 3 + 12 + 12 + 1; // Progress + Errors + Usage & Cost + Quit message
     let remaining_height = total_height.saturating_sub(fixed_height);
     
     // Split remaining height between Performance and Latency
@@ -99,24 +84,31 @@ pub fn draw(f: &mut Frame, model: &Model) {
             Constraint::Length(perf_latency_height),  // Performance (dynamic)
             Constraint::Length(perf_latency_height),  // Latency (dynamic)
             Constraint::Length(12),                   // Errors
-            Constraint::Length(12),                   // Usage & Cost (moved to bottom)
+            Constraint::Length(12),                   // Usage & Cost
+            Constraint::Length(1),                    // Quit message
         ])
         .split(f.area());
 
     // Render each component
     f.render_widget(ProgressWidget::new(model), chunks[0]);
     
-    // Use the stateful performance widget with chart
-    let performance_widget = StatefulPerformanceWidget::new(model);
+    // Use the new stateful performance widget with chart
+    let performance_widget = PerformanceWidget::new(&model.performance_state);
     performance_widget.render_with_chart(chunks[1], f.buffer_mut());
 
     // Use the stateful latency widget with chart
-    let latency_widget = StatefulLatencyWidget::new(model);
+    let latency_widget = LatencyWidget::new(&model.latency_state);
     latency_widget.render_with_chart(chunks[2], f.buffer_mut());
 
-    // Use the stateful error widget with chart
-    let error_widget = StatefulErrorWidget::new(model);
+    // Use the new stateful error widget with chart
+    let error_widget = ErrorWidget::new(&model.error_state, &model.metrics);
     error_widget.render_with_chart(chunks[3], f.buffer_mut());
     
     f.render_widget(UsageCostWidget::new(model), chunks[4]);
+    
+    // Render quit message at the bottom without borders
+    let quit_msg = ratatui::widgets::Paragraph::new("Press 'q' or ESC to quit")
+        .style(Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC))
+        .alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(quit_msg, chunks[5]);
 }

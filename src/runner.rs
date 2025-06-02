@@ -115,6 +115,7 @@ pub struct WorkloadRunner {
     pub usage_rx: watch::Receiver<Usage>,
     usage_task_abort: Arc<AtomicBool>,
     pub initial_usage: Usage,
+    workload_abort: Arc<AtomicBool>,
 }
 
 impl WorkloadRunner {
@@ -177,13 +178,27 @@ impl WorkloadRunner {
             usage_rx: rx,
             usage_task_abort: abort_flag,
             initial_usage,
+            workload_abort: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    pub fn stop_workload(&self) {
+        self.workload_abort.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_workload_stopped(&self) -> bool {
+        self.workload_abort.load(Ordering::Relaxed)
     }
 
     pub async fn run(&self, concurrency: u32, batches: usize) -> Result<()> {
         let mut set = JoinSet::new();
 
         for i in 0..batches {
+            // Check if we should stop before spawning more work
+            if self.is_workload_stopped() {
+                break;
+            }
+
             while set.len() >= concurrency as usize {
                 set.join_next().await;
             }
@@ -192,6 +207,7 @@ impl WorkloadRunner {
                 self.workload.single_statement.clone(),
                 i,
                 self.metrics.clone(),
+                self.workload_abort.clone(),
             ));
         }
 
@@ -288,12 +304,13 @@ async fn execute_batch_with_retry(
     sql: String,
     batch_id: usize,
     metrics: Metrics,
+    abort_flag: Arc<AtomicBool>,
 ) -> Result<()> {
     let retry_strategy = ExponentialBackoff::from_millis(10).map(jitter);
     let start = Instant::now();
 
     let result = Retry::spawn(retry_strategy, || {
-        execute_batch(&pool, sql.clone(), batch_id)
+        execute_batch(&pool, sql.clone(), batch_id, abort_flag.clone())
     })
     .await;
 
@@ -311,7 +328,12 @@ async fn execute_batch_with_retry(
     }
 }
 
-async fn execute_batch(pool: &Pool<Postgres>, sql: String, _batch_id: usize) -> Result<()> {
+async fn execute_batch(pool: &Pool<Postgres>, sql: String, _batch_id: usize, abort_flag: Arc<AtomicBool>) -> Result<()> {
+    // Check if we should abort before executing
+    if abort_flag.load(Ordering::Relaxed) {
+        return Err(anyhow::anyhow!("Workload aborted"));
+    }
+    
     sqlx::query(&sql).execute(pool).await?;
     Ok(())
 }

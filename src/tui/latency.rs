@@ -5,51 +5,43 @@ use ratatui::{
     symbols,
     widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph},
 };
+use std::time::Duration;
 
-use crate::tui::Model;
+use hdrhistogram::Histogram;
+use crate::history::{bucketing::{bucket_data, BucketConfig}, TimestampedHistory};
 
-/// Widget for displaying latency statistics
+/// State for the latency widget containing its history data
+#[derive(Clone)]
+pub struct LatencyState {
+    pub latest_latency_histogram: Histogram<u64>,
+    pub latency_histogram_history: TimestampedHistory<Histogram<u64>>,
+}
+
+impl LatencyState {
+    /// Create a new latency state with default values
+    pub fn new() -> Self {
+        Self {
+            latest_latency_histogram: Histogram::<u64>::new_with_bounds(1, 60_000 * 10, 3).unwrap(),
+            latency_histogram_history: TimestampedHistory::new(Duration::from_secs(300)),
+        }
+    }
+    
+    /// Update the latency state with a new histogram
+    pub fn update(&mut self, histogram: Histogram<u64>) {
+        self.latest_latency_histogram = histogram.clone();
+        self.latency_histogram_history.push(histogram);
+    }
+}
+
+/// Stateful latency widget that can render both simple stats and charts
 pub struct LatencyWidget<'a> {
-    model: &'a Model,
+    state: &'a LatencyState,
 }
 
 impl<'a> LatencyWidget<'a> {
-    /// Create a new latency widget with the given model
-    pub fn new(model: &'a Model) -> Self {
-        Self { model }
-    }
-}
-
-impl<'a> Widget for LatencyWidget<'a> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let p50 = self.model.latest_latency_histogram.value_at_quantile(0.50) as f64;
-        let p90 = self.model.latest_latency_histogram.value_at_quantile(0.90) as f64;
-        let p99 = self.model.latest_latency_histogram.value_at_quantile(0.99) as f64;
-        let p999 = self.model.latest_latency_histogram.value_at_quantile(0.999) as f64;
-        
-        let latency_text = vec![
-            format!("p50:   {:.1} ms", p50),
-            format!("p90:   {:.1} ms", p90),
-            format!("p99:   {:.1} ms", p99),
-            format!("p99.9: {:.1} ms", p999),
-        ].join("\n");
-        
-        let latency_para = Paragraph::new(latency_text)
-            .block(Block::default().title("Latency").borders(Borders::ALL));
-        
-        latency_para.render(area, buf);
-    }
-}
-
-/// Stateful latency widget with chart
-pub struct StatefulLatencyWidget<'a> {
-    model: &'a Model,
-}
-
-impl<'a> StatefulLatencyWidget<'a> {
-    /// Create a new stateful latency widget
-    pub fn new(model: &'a Model) -> Self {
-        Self { model }
+    /// Create a new latency widget with the given state
+    pub fn new(state: &'a LatencyState) -> Self {
+        Self { state }
     }
     
     /// Render with split layout for chart integration
@@ -71,10 +63,10 @@ impl<'a> StatefulLatencyWidget<'a> {
     }
     
     fn render_stats(&self, area: Rect, buf: &mut Buffer) {
-        let p50 = self.model.latest_latency_histogram.value_at_quantile(0.50) as f64;
-        let p90 = self.model.latest_latency_histogram.value_at_quantile(0.90) as f64;
-        let p99 = self.model.latest_latency_histogram.value_at_quantile(0.99) as f64;
-        let p999 = self.model.latest_latency_histogram.value_at_quantile(0.999) as f64;
+        let p50 = self.state.latest_latency_histogram.value_at_quantile(0.50) as f64;
+        let p90 = self.state.latest_latency_histogram.value_at_quantile(0.90) as f64;
+        let p99 = self.state.latest_latency_histogram.value_at_quantile(0.99) as f64;
+        let p999 = self.state.latest_latency_histogram.value_at_quantile(0.999) as f64;
         
         let latency_text = vec![
             format!("p50:   {:.1} ms", p50),
@@ -90,7 +82,7 @@ impl<'a> StatefulLatencyWidget<'a> {
     }
     
     fn render_chart(&self, area: Rect, buf: &mut Buffer) {
-        if self.model.latency_histogram_history.is_empty() {
+        if self.state.latency_histogram_history.is_empty() {
             // No data yet, just render empty block
             let block = Block::default()
                 .title("Latency Chart (5 min)")
@@ -99,18 +91,50 @@ impl<'a> StatefulLatencyWidget<'a> {
             return;
         }
 
+        // Use bucketing to get p50 and p99 data over time
+        let config = BucketConfig::new(Duration::from_secs(1), 300); // 300 seconds = 5 minutes
+        
+        // Get p50 buckets
+        let p50_buckets = bucket_data(
+            self.state.latency_histogram_history.data(),
+            config.clone(),
+            |histograms| {
+                if histograms.is_empty() {
+                    0.0
+                } else {
+                    // Take the most recent histogram in the bucket
+                    let latest_histogram = histograms.last().unwrap();
+                    latest_histogram.value_at_quantile(0.50) as f64
+                }
+            },
+            0.0, // default value for empty buckets
+        );
+
+        // Get p99 buckets
+        let p99_buckets = bucket_data(
+            self.state.latency_histogram_history.data(),
+            config,
+            |histograms| {
+                if histograms.is_empty() {
+                    0.0
+                } else {
+                    // Take the most recent histogram in the bucket
+                    let latest_histogram = histograms.last().unwrap();
+                    latest_histogram.value_at_quantile(0.99) as f64
+                }
+            },
+            0.0, // default value for empty buckets
+        );
+
         // Prepare data for chart
-        let data_len = self.model.latency_histogram_history.len();
-        let mut p50_data = Vec::with_capacity(data_len);
-        let mut p99_data = Vec::with_capacity(data_len);
+        let mut p50_data = Vec::with_capacity(p50_buckets.len());
+        let mut p99_data = Vec::with_capacity(p99_buckets.len());
         
         // Calculate max value for Y-axis scaling
         let mut max_latency: f64 = 0.0;
         
-        for (i, histogram) in self.model.latency_histogram_history.iter().enumerate() {
+        for (i, (&p50, &p99)) in p50_buckets.iter().zip(p99_buckets.iter()).enumerate() {
             let x = i as f64;
-            let p50 = histogram.value_at_quantile(0.50) as f64;
-            let p99 = histogram.value_at_quantile(0.99) as f64;
             p50_data.push((x, p50));
             p99_data.push((x, p99));
             max_latency = max_latency.max(p50).max(p99);
@@ -174,5 +198,11 @@ impl<'a> StatefulLatencyWidget<'a> {
             .hidden_legend_constraints((Constraint::Percentage(50), Constraint::Percentage(50)));
         
         chart.render(area, buf);
+    }
+}
+
+impl<'a> Widget for LatencyWidget<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        self.render_stats(area, buf);
     }
 }

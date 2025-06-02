@@ -7,63 +7,39 @@ use ratatui::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::tui::Model;
+use crate::history::{bucketing::{bucket_data, BucketConfig}, TimestampedHistory};
+use crate::runner::MetricsInner;
 
-/// Widget for displaying error information
-pub struct ErrorsWidget<'a> {
-    model: &'a Model,
+/// State for the error widget containing its history data
+#[derive(Clone)]
+pub struct ErrorState {
+    pub error_history: TimestampedHistory<f64>, // errors per second
 }
 
-impl<'a> ErrorsWidget<'a> {
-    /// Create a new errors widget with the given model
-    pub fn new(model: &'a Model) -> Self {
-        Self { model }
-    }
-}
-
-impl<'a> Widget for ErrorsWidget<'a> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let m = &self.model.metrics;
-        
-        let mut error_text = format!("Total errors: {}\n", m.error_count);
-        
-        if !m.last_errors.is_empty() {
-            error_text.push_str("\nRecent errors:\n");
-            for (i, error) in m.last_errors.iter().enumerate() {
-                let elapsed = error.timestamp.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
-                let seconds = elapsed.as_secs() % 60;
-                let minutes = (elapsed.as_secs() / 60) % 60;
-                let hours = (elapsed.as_secs() / 3600) % 24;
-                error_text.push_str(&format!("{}: [{}:{:02}:{:02}] {}\n", 
-                    i + 1, hours, minutes, seconds, 
-                    if error.message.len() > 60 { 
-                        format!("{}...", &error.message[..60]) 
-                    } else { 
-                        error.message.clone() 
-                    }
-                ));
-            }
+impl ErrorState {
+    /// Create a new error state with default values
+    pub fn new() -> Self {
+        Self {
+            error_history: TimestampedHistory::new(Duration::from_secs(300)),
         }
-        
-        error_text.push_str("\nPress 'q' or ESC to quit");
-        
-        let error_para = Paragraph::new(error_text)
-            .block(Block::default().title("Errors & Info").borders(Borders::ALL))
-            .wrap(Wrap { trim: true });
-        
-        error_para.render(area, buf);
+    }
+    
+    /// Update the error state with new error rate data
+    pub fn update(&mut self, errors_per_second: f64) {
+        self.error_history.push(errors_per_second);
     }
 }
 
-/// Enhanced error widget for future improvements
-pub struct StatefulErrorWidget<'a> {
-    model: &'a Model,
+/// Stateful error widget that can render both simple stats and charts
+pub struct ErrorWidget<'a> {
+    state: &'a ErrorState,
+    metrics: &'a MetricsInner,
 }
 
-impl<'a> StatefulErrorWidget<'a> {
-    /// Create a new stateful error widget
-    pub fn new(model: &'a Model) -> Self {
-        Self { model }
+impl<'a> ErrorWidget<'a> {
+    /// Create a new error widget with the given state and metrics
+    pub fn new(state: &'a ErrorState, metrics: &'a MetricsInner) -> Self {
+        Self { state, metrics }
     }
     
     /// Render with split layout for chart integration
@@ -85,17 +61,15 @@ impl<'a> StatefulErrorWidget<'a> {
     }
     
     fn render_error_list(&self, area: Rect, buf: &mut Buffer) {
-        let m = &self.model.metrics;
-        
         let mut items: Vec<ListItem> = vec![
-            ListItem::new(format!("Total errors: {}", m.error_count)),
+            ListItem::new(format!("Total errors: {}", self.metrics.error_count)),
         ];
         
-        if !m.last_errors.is_empty() {
+        if !self.metrics.last_errors.is_empty() {
             items.push(ListItem::new(""));
             items.push(ListItem::new("Recent errors:"));
             
-            for error in m.last_errors.iter() {
+            for error in self.metrics.last_errors.iter() {
                 let now = SystemTime::now();
                 let elapsed = now.duration_since(error.timestamp).unwrap_or(Duration::ZERO);
                 let time_str = if elapsed.as_secs() < 60 {
@@ -116,8 +90,7 @@ impl<'a> StatefulErrorWidget<'a> {
             }
         }
         
-        items.push(ListItem::new(""));
-        items.push(ListItem::new("Press 'q' or ESC to quit"));
+
         
         let list = List::new(items)
             .block(Block::default().title("Errors & Info").borders(Borders::ALL));
@@ -126,7 +99,7 @@ impl<'a> StatefulErrorWidget<'a> {
     }
     
     fn render_chart(&self, area: Rect, buf: &mut Buffer) {
-        if self.model.error_history.is_empty() {
+        if self.state.error_history.is_empty() {
             // No data yet, just render empty block
             let block = Block::default()
                 .title("Error Rate (5 min)")
@@ -135,12 +108,27 @@ impl<'a> StatefulErrorWidget<'a> {
             return;
         }
 
+        // Use bucketing to convert timestamped data to chart data
+        let config = BucketConfig::new(Duration::from_secs(1), 300); // 300 seconds = 5 minutes
+        let buckets = bucket_data(
+            self.state.error_history.data(),
+            config,
+            |values| {
+                // Average the values in each bucket
+                if values.is_empty() {
+                    0.0
+                } else {
+                    values.iter().map(|&&v| v).sum::<f64>() / values.len() as f64
+                }
+            },
+            0.0, // default value for empty buckets
+        );
+
         // Prepare data for chart
-        let data_len = self.model.error_history.len();
-        let mut error_data = Vec::with_capacity(data_len);
+        let mut error_data = Vec::with_capacity(buckets.len());
         let mut max_errors: f64 = 0.0;
         
-        for (i, &errors_per_sec) in self.model.error_history.iter().enumerate() {
+        for (i, &errors_per_sec) in buckets.iter().enumerate() {
             let x = i as f64;
             error_data.push((x, errors_per_sec));
             max_errors = max_errors.max(errors_per_sec);
@@ -198,5 +186,37 @@ impl<'a> StatefulErrorWidget<'a> {
             .hidden_legend_constraints((Constraint::Percentage(50), Constraint::Percentage(50)));
         
         chart.render(area, buf);
+    }
+}
+
+impl<'a> Widget for ErrorWidget<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let mut error_text = format!("Total errors: {}\n", self.metrics.error_count);
+        
+        if !self.metrics.last_errors.is_empty() {
+            error_text.push_str("\nRecent errors:\n");
+            for (i, error) in self.metrics.last_errors.iter().enumerate() {
+                let elapsed = error.timestamp.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+                let seconds = elapsed.as_secs() % 60;
+                let minutes = (elapsed.as_secs() / 60) % 60;
+                let hours = (elapsed.as_secs() / 3600) % 24;
+                error_text.push_str(&format!("{}: [{}:{:02}:{:02}] {}\n", 
+                    i + 1, hours, minutes, seconds, 
+                    if error.message.len() > 60 { 
+                        format!("{}...", &error.message[..60]) 
+                    } else { 
+                        error.message.clone() 
+                    }
+                ));
+            }
+        }
+        
+        error_text.push_str("\nPress 'q' or ESC to quit");
+        
+        let error_para = Paragraph::new(error_text)
+            .block(Block::default().title("Errors & Info").borders(Borders::ALL))
+            .wrap(Wrap { trim: true });
+        
+        error_para.render(area, buf);
     }
 }
