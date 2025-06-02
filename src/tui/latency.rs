@@ -58,7 +58,7 @@ impl<'a> StatefulLatencyWidget<'a> {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(20), // Fixed width for stats
+                Constraint::Length(30), // Fixed width for stats (consistent with performance)
                 Constraint::Min(40),    // Remaining width for chart
             ])
             .split(area);

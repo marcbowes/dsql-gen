@@ -48,8 +48,9 @@ impl MonitorUI {
             interval.tick().await;
 
             // Get TPS and reset counter
-            let (completed, latency_histogram) = runner.metrics.get_and_reset();
+            let (completed, errors, latency_histogram) = runner.metrics.get_and_reset();
             let tps = completed as f64 / interval_secs;
+            let eps = errors as f64 / interval_secs; // errors per second
             
             // Update model with new data
             model.tps = tps;
@@ -76,6 +77,12 @@ impl MonitorUI {
 
             model.pool_size = runner.pool.size() as usize;
             model.pool_idle = runner.pool.num_idle() as usize;
+            
+            // Store error rate history
+            model.error_history.push_back(eps);
+            if model.error_history.len() > 300 {
+                model.error_history.pop_front();
+            }
 
             model.latest_usage = runner.usage_rx.borrow().clone();
             model.usage_diff = if runner.usage_rx.has_changed().unwrap() {

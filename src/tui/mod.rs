@@ -3,95 +3,25 @@
 //! This module contains all the UI components for the terminal user interface,
 //! organized as separate modules for each section of the UI.
 
-pub mod progress;
-pub mod performance;
-pub mod latency;
-pub mod usage_cost;
-pub mod errors;
-
-// Re-export commonly used types
-pub use progress::ProgressWidget;
-pub use performance::PerformanceWidget;
-pub use latency::{LatencyWidget, StatefulLatencyWidget};
-pub use usage_cost::UsageCostWidget;
-pub use errors::ErrorsWidget;
-
-use ratatui::prelude::*;
 use std::collections::VecDeque;
-use std::default::Default;
-use crate::runner::MetricsInner;
-use crate::usage::{Usage, DpuMetrics, StorageMetrics, CostEstimate, DpuCost, StorageCost};
+
 use hdrhistogram::Histogram;
+use ratatui::prelude::*;
 
-// Default implementations for Usage-related types
-impl Default for DpuMetrics {
-    fn default() -> Self {
-        Self {
-            total: 0.0,
-            compute: 0.0,
-            read: 0.0,
-            write: 0.0,
-        }
-    }
-}
+pub mod errors;
+pub mod latency;
+pub mod performance;
+pub mod progress;
+pub mod usage_cost;
 
-impl Default for StorageMetrics {
-    fn default() -> Self {
-        Self {
-            size_bytes: 0.0,
-        }
-    }
-}
+use errors::StatefulErrorWidget;
+use latency::StatefulLatencyWidget;
+use performance::StatefulPerformanceWidget;
+use progress::ProgressWidget;
+use usage_cost::UsageCostWidget;
 
-impl Default for DpuCost {
-    fn default() -> Self {
-        Self {
-            total: 0.0,
-            compute: 0.0,
-            read: 0.0,
-            write: 0.0,
-        }
-    }
-}
-
-impl Default for StorageCost {
-    fn default() -> Self {
-        Self {
-            gb_month: 0.0,
-        }
-    }
-}
-
-impl Default for CostEstimate {
-    fn default() -> Self {
-        Self {
-            total_dpus: DpuCost::default(),
-            latest_storage: StorageCost::default(),
-        }
-    }
-}
-
-impl Default for Usage {
-    fn default() -> Self {
-        Self {
-            dpu_metrics: DpuMetrics::default(),
-            storage_metrics: StorageMetrics::default(),
-            cost_estimate: CostEstimate::default(),
-        }
-    }
-}
-
-impl Default for MetricsInner {
-    fn default() -> Self {
-        Self {
-            completed_batches: 0,
-            completed_since_last_tick: 0,
-            error_count: 0,
-            last_errors: VecDeque::with_capacity(3),
-            latency_histogram: Histogram::<u64>::new_with_bounds(1, 60_000 * 10, 3).unwrap(),
-        }
-    }
-}
+use crate::runner::MetricsInner;
+use crate::usage::Usage;
 
 /// The main model containing all UI state
 #[derive(Clone)]
@@ -104,13 +34,13 @@ pub struct Model {
     pub bps_formatted: String,
     pub pool_size: usize,
     pub pool_idle: usize,
-    pub latest_latency_histogram: Histogram::<u64>,
+    pub latest_latency_histogram: Histogram<u64>,
     pub latest_usage: Usage,
     pub usage_diff: Usage,
     pub usage_diff_from_start: Usage,
     pub tps_history: VecDeque<f64>,
-    pub latency_histogram_history: VecDeque<Histogram::<u64>>, // Store full histograms
-    pub error_history: VecDeque<f64>, // errors per second
+    pub latency_histogram_history: VecDeque<Histogram<u64>>, // Store full histograms
+    pub error_history: VecDeque<f64>,                        // errors per second
 }
 
 impl Model {
@@ -138,26 +68,55 @@ impl Model {
 
 /// The main UI function that renders all components
 pub fn draw(f: &mut Frame, model: &Model) {
+    // Calculate available height after fixed sections
+    let total_height = f.area().height.saturating_sub(2); // Account for margin
+    let fixed_height = 3 + 12 + 12; // Progress + Errors + Usage & Cost
+    let remaining_height = total_height.saturating_sub(fixed_height);
+    
+    // Split remaining height between Performance and Latency
+    let perf_latency_height = remaining_height / 2;
+    
+    // Error if not enough space for charts
+    if perf_latency_height < 12 {
+        // Render error message if terminal too small
+        let error_msg = format!(
+            "Terminal too small! Need at least {} lines, have {}",
+            fixed_height + 24, // 24 = 12 lines each for perf and latency
+            total_height
+        );
+        let error_para = ratatui::widgets::Paragraph::new(error_msg)
+            .block(ratatui::widgets::Block::default().title("Error").borders(ratatui::widgets::Borders::ALL))
+            .style(Style::default().fg(Color::Red));
+        error_para.render(f.area(), f.buffer_mut());
+        return;
+    }
+    
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(3),  // Progress
-            Constraint::Length(6),  // Performance
-            Constraint::Length(12), // Latency (increased for better chart visibility)
-            Constraint::Length(12), // Usage & Cost
-            Constraint::Min(0),     // Errors
+            Constraint::Length(3),                    // Progress
+            Constraint::Length(perf_latency_height),  // Performance (dynamic)
+            Constraint::Length(perf_latency_height),  // Latency (dynamic)
+            Constraint::Length(12),                   // Errors
+            Constraint::Length(12),                   // Usage & Cost (moved to bottom)
         ])
         .split(f.area());
 
     // Render each component
     f.render_widget(ProgressWidget::new(model), chunks[0]);
-    f.render_widget(PerformanceWidget::new(model), chunks[1]);
     
+    // Use the stateful performance widget with chart
+    let performance_widget = StatefulPerformanceWidget::new(model);
+    performance_widget.render_with_chart(chunks[1], f.buffer_mut());
+
     // Use the stateful latency widget with chart
     let latency_widget = StatefulLatencyWidget::new(model);
     latency_widget.render_with_chart(chunks[2], f.buffer_mut());
+
+    // Use the stateful error widget with chart
+    let error_widget = StatefulErrorWidget::new(model);
+    error_widget.render_with_chart(chunks[3], f.buffer_mut());
     
-    f.render_widget(UsageCostWidget::new(model), chunks[3]);
-    f.render_widget(ErrorsWidget::new(model), chunks[4]);
+    f.render_widget(UsageCostWidget::new(model), chunks[4]);
 }

@@ -16,7 +16,7 @@ pub struct UsageCalculator {
     cloudwatch_client: CloudWatchClient,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct DpuMetrics {
     pub total: f64,
     pub compute: f64,
@@ -37,7 +37,7 @@ impl ops::Sub for DpuMetrics {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct DpuCost {
     pub total: f64,
     pub compute: f64,
@@ -58,7 +58,7 @@ impl ops::Sub for DpuCost {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct StorageMetrics {
     pub size_bytes: f64,
 }
@@ -73,7 +73,7 @@ impl ops::Sub for StorageMetrics {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct StorageCost {
     pub gb_month: f64,
 }
@@ -88,7 +88,7 @@ impl ops::Sub for StorageCost {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct Usage {
     pub dpu_metrics: DpuMetrics,
     pub storage_metrics: StorageMetrics,
@@ -148,7 +148,7 @@ impl Usage {
 ///
 /// If you want to adapt this calculator for your own purpose, please make sure
 /// you understand pricing, and your use-case.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct CostEstimate {
     pub total_dpus: DpuCost,
     pub latest_storage: StorageCost,
