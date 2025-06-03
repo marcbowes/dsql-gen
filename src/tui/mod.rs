@@ -87,28 +87,6 @@ impl Default for Metrics {
 }
 
 impl Metrics {
-    pub fn record_success(&mut self, duration_ms: u64) {
-        self.completed_batches += 1;
-        self.completed_since_last_tick += 1;
-
-        self.latency_histogram
-            .record(duration_ms)
-            .expect("histogram is correctly configured");
-    }
-
-    pub fn record_error(&mut self, error: String) {
-        self.error_count += 1;
-        self.errors_since_last_tick += 1;
-
-        if self.last_errors.len() >= 5 {
-            self.last_errors.pop_front();
-        }
-        self.last_errors.push_back(ErrorEntry {
-            timestamp: SystemTime::now(),
-            message: error,
-        });
-    }
-
     pub fn get_and_reset(&mut self) -> (usize, usize, Histogram<u64>) {
         let completed = self.completed_since_last_tick;
         let errors = self.errors_since_last_tick;

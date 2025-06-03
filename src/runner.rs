@@ -94,11 +94,18 @@ impl WorkloadRunner {
                     // }
                 }
 
-                let _pool = pool.clone();
-                let _workload = workload.clone();
-                let _tx = tx.clone();
+                // FIXME: This loop is buggy - it doesn't complete inflight
 
-                set.spawn(async move { execute_batch_with_retry(_pool, _workload, _tx).await });
+                let remaining = batches
+                    .load(Ordering::SeqCst)
+                    .saturating_sub(complete + set.len());
+                if remaining > 0 {
+                    set.spawn(execute_batch_with_retry(
+                        pool.clone(),
+                        workload.clone(),
+                        tx.clone(),
+                    ));
+                }
             }
 
             while set.join_next().await.is_some() {}
