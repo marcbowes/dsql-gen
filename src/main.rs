@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::num::NonZero;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -118,7 +119,7 @@ async fn run_load_generator(args: RunArgs) -> Result<()> {
         sdk_config,
         args.workload,
         args.rows,
-        args.concurrency,
+        NonZero::new(args.concurrency).ok_or_else(|| anyhow!("concurrency must be non-zero"))?,
         args.batches,
         tx.clone(),
     )

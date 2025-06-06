@@ -40,8 +40,6 @@ pub struct Model {
 
 impl Model {
     pub fn new(runner: WorkloadRunner) -> Self {
-        let pool = runner.pool.clone();
-
         Self {
             runner,
             metrics: Metrics::default(),
@@ -50,7 +48,7 @@ impl Model {
             latest_usage: Usage::default(),
             usage_diff_from_start: Usage::default(),
             latency_state: LatencyState::new(),
-            performance_state: PerformanceState::new(pool),
+            performance_state: PerformanceState::new(),
             error_state: ErrorState::new(),
             workload_modal_state: WorkloadModalState::new(),
         }

@@ -8,7 +8,6 @@ use ratatui::{
     symbols,
     widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph},
 };
-use sqlx::{Pool, Postgres};
 
 use crate::{
     events::QueryOk,
@@ -22,15 +21,15 @@ use crate::{
 #[derive(Clone)]
 pub struct PerformanceState {
     pub tps_history: TimestampedHistory<QueryOk>,
-    pub pool: Pool<Postgres>,
+    pub open: usize,
 }
 
 impl PerformanceState {
     /// Create a new performance state with default values
-    pub fn new(pool: Pool<Postgres>) -> Self {
+    pub fn new() -> Self {
         Self {
             tps_history: TimestampedHistory::new(Duration::from_secs(300)),
-            pool,
+            open: 0,
         }
     }
 
@@ -96,11 +95,7 @@ impl<'a> PerformanceWidget<'a> {
                 bps_unit.get_value(),
                 bps_unit.get_unit()
             ),
-            format!(
-                "Pool: {} open, {} idle",
-                self.state.pool.size(),
-                self.state.pool.num_idle()
-            ),
+            format!("Pool: {} open", self.state.open),
         ]
         .join("\n");
 

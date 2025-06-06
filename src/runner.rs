@@ -1,22 +1,21 @@
+use std::num::NonZero;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::Result;
 use aws_config::SdkConfig;
-use aws_sdk_dsql::auth_token::{AuthToken, AuthTokenGenerator, Config as AuthConfig};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use sqlx::{Pool, Postgres};
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::{self, sleep};
+use tokio::time::sleep;
 use tokio_retry::strategy::{jitter, ExponentialBackoff};
 
 use crate::events::{Message, QueryErr, QueryOk, QueryResult};
+use crate::pool::{Bundle, ConnectionPool, PoolConfig};
 use crate::workload::{self, Workload};
 
 pub struct WorkloadRunner {
-    pub pool: Pool<Postgres>,
+    pub pool: ConnectionPool,
     workload: Workload,
     concurrency: Arc<AtomicUsize>,
     batches: Arc<AtomicUsize>,
@@ -30,7 +29,7 @@ impl WorkloadRunner {
         sdk_config: SdkConfig,
         workload_name: String,
         rows: usize,
-        concurrency: usize,
+        concurrency: NonZero<usize>,
         batches: usize,
         tx: mpsc::Sender<Message>,
     ) -> Result<Self> {
@@ -40,17 +39,40 @@ impl WorkloadRunner {
             .ok_or_else(|| anyhow::anyhow!("unknown workload"))?
             .clone();
 
-        tracing::info!(%endpoint, %concurrency, "opening connection pool");
-        let pool =
-            establish_connection_pool(endpoint.clone(), sdk_config.clone(), concurrency as u32)
-                .await?;
-        tracing::info!("pool ready");
+        let mut config = tokio_postgres::Config::new();
+        config.host(endpoint);
+        config.user("admin");
+        config.dbname("postgres");
+        config.ssl_mode(tokio_postgres::config::SslMode::Require);
+        config.ssl_negotiation(tokio_postgres::config::SslNegotiation::Direct);
 
-        tracing::info!(setup = %workload.setup, "running workload setup");
-        sqlx::query(&workload.setup).execute(&pool).await?;
-        tracing::info!("schema ready");
+        tracing::info!("launching pool");
+        let (pool, mut telemetry) = ConnectionPool::launch(
+            Bundle::new_with_sdk_config(config, sdk_config)?,
+            PoolConfig {
+                desired: concurrency,
+                concurrent: concurrency,
+            },
+        )
+        .await?;
 
-        let concurrency = Arc::new(AtomicUsize::new(concurrency));
+        let _telem = tx.clone();
+        tokio::spawn(async move {
+            while let Some(t) = telemetry.recv().await {
+                _telem.send(Message::PoolTelemetry(t)).await?;
+            }
+            anyhow::Ok(())
+        });
+
+        {
+            tracing::info!(setup = %workload.setup, "will setup schema");
+            let conn = pool.borrow().await;
+            tracing::info!("connection acquired");
+            _ = conn.execute(&workload.setup, &[]).await?;
+            tracing::info!("schema ready");
+        }
+
+        let concurrency = Arc::new(AtomicUsize::new(concurrency.get()));
         let batches = Arc::new(AtomicUsize::new(batches));
 
         Ok(Self {
@@ -132,25 +154,17 @@ impl WorkloadRunner {
     }
 }
 
-impl Drop for WorkloadRunner {
-    fn drop(&mut self) {
-        let pool = self.pool.clone();
-        tokio::spawn(async move {
-            pool.close().await;
-        });
-    }
-}
-
 /// Execute a batch with retry logic
 async fn execute_batch_with_retry(
-    pool: Pool<Postgres>,
+    pool: ConnectionPool,
     workload: Workload,
     tx: mpsc::Sender<Message>,
 ) -> bool {
     let retry_strategy = ExponentialBackoff::from_millis(10).map(jitter);
     for backoff in retry_strategy {
         let start = Instant::now();
-        match sqlx::query(&workload.single_statement).execute(&pool).await {
+
+        match attempt(pool.clone(), workload.clone()).await {
             Ok(_) => {
                 _ = tx
                     .send(Message::QueryResult(QueryResult::Ok(QueryOk {
@@ -179,68 +193,12 @@ async fn execute_batch_with_retry(
     false
 }
 
-/// Generate a password token for connection to the database
-async fn generate_password_token(
-    signer: &AuthTokenGenerator,
-    sdk_config: &SdkConfig,
-) -> Result<AuthToken> {
-    signer
-        .db_connect_admin_auth_token(sdk_config)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to generate auth token: {}", e))
-}
-
-/// Establish a connection pool to the database
-async fn establish_connection_pool(
-    endpoint: String,
-    sdk_config: SdkConfig,
-    connections: u32,
-) -> Result<Pool<Postgres>> {
-    let signer = AuthTokenGenerator::new(
-        AuthConfig::builder()
-            .hostname(&endpoint)
-            .expires_in(900)
-            .build()
-            .map_err(|e| anyhow::anyhow!("Failed to build auth config: {}", e))?,
-    );
-
-    let password_token = generate_password_token(&signer, &sdk_config).await?;
-
-    let connection_options = PgConnectOptions::new()
-        .host(&endpoint)
-        .port(5432)
-        .database("postgres")
-        .username("admin")
-        .password(password_token.as_str())
-        .ssl_mode(sqlx::postgres::PgSslMode::VerifyFull);
-
-    let pool = PgPoolOptions::new()
-        // .min_connections(connections) // Makes it too slow to start.
-        .max_connections(connections)
-        .acquire_timeout(Duration::from_secs(30))
-        .idle_timeout(Duration::from_secs(3600))
-        .max_lifetime(Duration::from_secs(3600))
-        .connect_with(connection_options.clone())
+async fn attempt(pool: ConnectionPool, workload: Workload) -> Result<()> {
+    let client = pool.borrow().await;
+    let statement = client
+        .statement("payload", workload.single_statement)
         .await?;
+    _ = client.execute(&statement, &[]).await?;
 
-    // Periodically refresh the password by regenerating the token.
-    let _pool = pool.clone(); // Pool uses an Arc internally
-    tokio::spawn(async move {
-        loop {
-            time::sleep(Duration::from_secs(600)).await;
-
-            match generate_password_token(&signer, &sdk_config).await {
-                Ok(password_token) => {
-                    let connect_options_with_new_token =
-                        connection_options.clone().password(password_token.as_str());
-                    _pool.set_connect_options(connect_options_with_new_token);
-                }
-                Err(err) => {
-                    eprintln!("Failed to refresh authentication token: {err}");
-                }
-            }
-        }
-    });
-
-    Ok(pool)
+    Ok(())
 }

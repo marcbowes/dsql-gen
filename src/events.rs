@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::usage::Usage;
+use crate::{pool, usage::Usage};
 
 #[derive(Debug, Clone)]
 pub enum QueryResult {
@@ -24,7 +24,7 @@ pub struct QueryErr {
 }
 
 /// Messages sent from the runner to the UI
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Message {
     /// A batch completed successfully or failed
     QueryResult(QueryResult),
@@ -34,6 +34,8 @@ pub enum Message {
     UsageUpdated(Usage),
     /// All batches have completed
     WorkloadComplete,
+    /// Pool telemetry
+    PoolTelemetry(pool::Telemetry),
 }
 
 /// Runner event listener that processes events and updates UI state
@@ -81,6 +83,11 @@ impl EventListener {
             Message::WorkloadComplete => {
                 self.completed = true;
             }
+            Message::PoolTelemetry(telemetry) => match telemetry {
+                pool::Telemetry::Connected(_) => model.performance_state.open += 1,
+                pool::Telemetry::Disconnected(_) => model.performance_state.open -= 1,
+                pool::Telemetry::Err { err, .. } => model.error_state.record_error(err.to_string()),
+            },
         }
     }
 
