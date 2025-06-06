@@ -16,7 +16,7 @@ pub struct Workload {
 
 pub fn load_all(n: usize) -> HashMap<String, Workload> {
     let mut all = HashMap::new();
-    for wl in [tiny_rows(n), one_kib_rows(n)] {
+    for wl in [tiny_rows(n), one_kib_rows(n), counter(1)] {
         all.insert(wl.name.clone(), wl);
     }
     all
@@ -51,5 +51,20 @@ pub fn one_kib_rows(n: usize) -> Workload {
         ),
         rows_inserted: n,
         per_row_logical_bytes_written: 1024,
+    }
+}
+
+// FIXME: this doesn't fit in well with the other workloads
+pub fn counter(n: usize) -> Workload {
+    Workload {
+        name: "counter".to_string(),
+        setup: "CREATE TABLE IF NOT EXISTS counter (
+    id INT PRIMARY KEY,
+    value int
+);"
+        .to_string(),
+        single_statement: format!("UPDATE counter SET value = value + 1 WHERE id = {n}"),
+        rows_inserted: 1,
+        per_row_logical_bytes_written: 12,
     }
 }

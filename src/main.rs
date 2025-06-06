@@ -1,6 +1,5 @@
 use std::fs::File;
 use std::num::NonZero;
-use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use aws_config::{BehaviorVersion, Region, SdkConfig};
@@ -12,7 +11,6 @@ use tokio::task::{self, JoinHandle};
 use dsql_gen::runner::WorkloadRunner;
 use dsql_gen::ui::MonitorUI;
 use dsql_gen::usage::{self, Usage, UsageCalculator};
-use tokio::time::sleep;
 use tracing::Level;
 use tracing_appender::non_blocking::NonBlocking;
 use tracing_subscriber::EnvFilter;
@@ -38,6 +36,11 @@ struct RunArgs {
     #[arg(short, long)]
     identifier: String,
 
+    /// An optional endpoint override to use. The endpoint is usually
+    /// automatically built from the identifier and region.
+    #[arg(short, long)]
+    endpoint: Option<String>,
+
     /// AWS region
     #[arg(short, long, env = "AWS_REGION")]
     region: Option<String>,
@@ -57,10 +60,18 @@ struct RunArgs {
     /// Workload rows
     #[arg(short = 'n', long, default_value_t = 0)]
     rows: usize,
+
+    /// Whether to watch CloudWatch metrics or not.
+    #[arg(long, default_value_t = false)]
+    no_usage: bool,
 }
 
 impl RunArgs {
     fn endpoint(&self, sdk_config: &SdkConfig) -> Result<String> {
+        if let Some(endpoint) = &self.endpoint {
+            return Ok(endpoint.clone());
+        }
+
         let region = sdk_config
             .region()
             .ok_or_else(|| anyhow!("no region set"))?;
@@ -125,22 +136,24 @@ async fn run_load_generator(args: RunArgs) -> Result<()> {
     )
     .await?;
 
-    // make sure this is after the setup runs.
-    let initial_usage = calc.get_initial_usage().await?;
-    usage::print(&initial_usage);
-    let watch_usage = calc.spawn_monitor(initial_usage);
+    if !args.no_usage {
+        // make sure this is after the setup runs.
+        let initial_usage = calc.get_initial_usage().await?;
+        usage::print(&initial_usage);
+        let watch_usage = calc.spawn_monitor(initial_usage);
 
-    // notify the UI of usage updates.
-    let tx_usage = tx.clone();
-    let mut _watch_usage = watch_usage.clone();
-    tx_usage.send(Message::InitialUsage(initial_usage)).await?;
-    let _send_usage: JoinHandle<Result<()>> = tokio::spawn(async move {
-        loop {
-            _watch_usage.changed().await?;
-            let usage = *_watch_usage.borrow();
-            tx_usage.send(Message::UsageUpdated(usage)).await?;
-        }
-    });
+        // notify the UI of usage updates.
+        let tx_usage = tx.clone();
+        let mut _watch_usage = watch_usage.clone();
+        tx_usage.send(Message::InitialUsage(initial_usage)).await?;
+        let _send_usage: JoinHandle<Result<()>> = tokio::spawn(async move {
+            loop {
+                _watch_usage.changed().await?;
+                let usage = *_watch_usage.borrow();
+                tx_usage.send(Message::UsageUpdated(usage)).await?;
+            }
+        });
+    }
 
     // Start the UI in a separate task
     let ui = task::spawn(async move {
@@ -153,12 +166,14 @@ async fn run_load_generator(args: RunArgs) -> Result<()> {
         eprintln!("{err:?}");
     }
 
-    println!("waiting for final usage");
-    sleep(Duration::from_secs(90)).await;
-    let final_usage = *watch_usage.borrow();
+    // if args.usage {
+    //     println!("waiting for final usage");
+    //     sleep(Duration::from_secs(90)).await;
 
-    let usage_diff = final_usage - initial_usage;
-    usage::print_with_diff(&final_usage, &usage_diff);
+    //     let final_usage = *watch_usage.borrow();
+    //     let usage_diff = final_usage - initial_usage;
+    //     usage::print_with_diff(&final_usage, &usage_diff);
+    // }
 
     Ok(())
 }
