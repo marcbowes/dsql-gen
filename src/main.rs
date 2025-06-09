@@ -41,6 +41,10 @@ struct RunArgs {
     #[arg(short, long)]
     endpoint: Option<String>,
 
+    /// DB user
+    #[arg(short, long, default_value = "admin")]
+    user: String,
+
     /// AWS region
     #[arg(short, long, env = "AWS_REGION")]
     region: Option<String>,
@@ -127,6 +131,7 @@ async fn run_load_generator(args: RunArgs) -> Result<()> {
     // Create the workload runner
     let runner = WorkloadRunner::new(
         args.endpoint(&sdk_config)?,
+        args.user,
         sdk_config,
         args.workload,
         args.rows,

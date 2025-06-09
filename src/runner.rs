@@ -26,6 +26,7 @@ impl WorkloadRunner {
     /// Create a new workload runner with the given configuration
     pub async fn new(
         endpoint: String,
+        user: String,
         sdk_config: SdkConfig,
         workload_name: String,
         rows: usize,
@@ -41,7 +42,7 @@ impl WorkloadRunner {
 
         let mut config = tokio_postgres::Config::new();
         config.host(endpoint);
-        config.user("admin");
+        config.user(user);
         config.dbname("postgres");
         config.ssl_mode(tokio_postgres::config::SslMode::Require);
         config.ssl_negotiation(tokio_postgres::config::SslNegotiation::Direct);
