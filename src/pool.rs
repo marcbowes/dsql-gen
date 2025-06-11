@@ -110,13 +110,13 @@ impl Client {
     pub async fn statement(
         &self,
         name: &'static str,
-        query: String,
+        query: impl AsRef<str>,
     ) -> Result<Statement, tokio_postgres::Error> {
         let mut known = self.statements.lock().await;
         match known.get(name) {
             Some(statement) => Ok(statement.clone()),
             None => {
-                let statement = self.prepare(query.as_str()).await?;
+                let statement = self.prepare(query.as_ref()).await?;
                 known.insert(name, statement.clone());
                 Ok(statement)
             }

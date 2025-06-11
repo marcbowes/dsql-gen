@@ -1,14 +1,17 @@
 use std::fs::File;
 use std::num::NonZero;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use clap::Parser;
 use dsql_gen::events::Message;
+use dsql_gen::workloads::onekib::{OneKibRows, OneKibRowsArgs};
+use dsql_gen::workloads::tiny::{TinyRows, TinyRowsArgs};
 use tokio::sync::mpsc;
 use tokio::task::{self, JoinHandle};
 
-use dsql_gen::runner::WorkloadRunner;
+use dsql_gen::runner::{SharedWorkload, WorkloadRunner};
 use dsql_gen::ui::MonitorUI;
 use dsql_gen::usage::{self, Usage, UsageCalculator};
 use tracing::Level;
@@ -25,13 +28,13 @@ struct Args {
 #[derive(Parser, Debug)]
 enum Commands {
     /// Run the load generator
-    Run(RunArgs),
+    Workload(WorkloadArgs),
     /// Print usage information for a cluster
     Usage(UsageArgs),
 }
 
 #[derive(Parser, Debug)]
-struct RunArgs {
+struct WorkloadArgs {
     /// AWS DSQL cluster ID
     #[arg(short, long)]
     identifier: String,
@@ -57,20 +60,33 @@ struct RunArgs {
     #[arg(short, long, default_value_t = 2000)]
     batches: usize,
 
-    /// Workload name
-    #[arg(short, long)]
-    workload: String,
-
-    /// Workload rows
-    #[arg(short = 'n', long, default_value_t = 0)]
-    rows: usize,
-
     /// Whether to watch CloudWatch metrics or not.
     #[arg(long, default_value_t = false)]
     no_usage: bool,
+
+    /// Workload to run
+    #[command(subcommand)]
+    workload: WorkloadCommands,
 }
 
-impl RunArgs {
+#[derive(Parser, Debug, Clone)]
+enum WorkloadCommands {
+    /// Run the tiny insert workload
+    Tiny(TinyRowsArgs),
+    /// Run the 1KiB insert workload
+    OneKib(OneKibRowsArgs),
+}
+
+impl WorkloadCommands {
+    fn to_workload(&self) -> SharedWorkload {
+        match self {
+            WorkloadCommands::Tiny(args) => Arc::new(TinyRows::new(args.clone())),
+            WorkloadCommands::OneKib(args) => Arc::new(OneKibRows::new(args.clone())),
+        }
+    }
+}
+
+impl WorkloadArgs {
     fn endpoint(&self, sdk_config: &SdkConfig) -> Result<String> {
         if let Some(endpoint) = &self.endpoint {
             return Ok(endpoint.clone());
@@ -116,13 +132,10 @@ struct UsageArgs {
     region: Option<String>,
 }
 
-async fn run_load_generator(args: RunArgs) -> Result<()> {
+async fn run_load_generator(args: WorkloadArgs) -> Result<()> {
     let sdk_config = args.sdk_config().await;
 
-    if args.rows == 0 {
-        println!("setup complete, no rows requested");
-        return Ok(());
-    }
+    let workload = args.workload.to_workload();
 
     let (tx, rx) = mpsc::channel(1000);
 
@@ -133,8 +146,7 @@ async fn run_load_generator(args: RunArgs) -> Result<()> {
         args.endpoint(&sdk_config)?,
         args.user,
         sdk_config,
-        args.workload,
-        args.rows,
+        workload,
         NonZero::new(args.concurrency).ok_or_else(|| anyhow!("concurrency must be non-zero"))?,
         args.batches,
         tx.clone(),
@@ -223,7 +235,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
-        Commands::Run(run_args) => run_load_generator(run_args).await?,
+        Commands::Workload(run_args) => run_load_generator(run_args).await?,
         Commands::Usage(print_args) => print_cluster_usage(print_args).await?,
     }
 

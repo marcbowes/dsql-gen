@@ -5,4 +5,4 @@ pub mod runner;
 pub mod tui;
 pub mod ui;
 pub mod usage;
-pub mod workload;
+pub mod workloads;

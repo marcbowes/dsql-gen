@@ -13,29 +13,25 @@ pub mod latency;
 pub mod performance;
 pub mod progress;
 pub mod usage_cost;
-pub mod workload_modal;
 
 use errors::{ErrorState, ErrorWidget};
 use latency::{LatencyState, LatencyWidget};
 use performance::{PerformanceState, PerformanceWidget};
-use progress::ProgressWidget;
-use usage_cost::UsageCostWidget;
-use workload_modal::{WorkloadModalState, WorkloadModalWidget};
+use progress::{ProgressWidget, ProgressWidgetState};
+use usage_cost::{UsageCostState, UsageCostWidget};
 
-use crate::{runner::WorkloadRunner, usage::Usage};
+use crate::runner::WorkloadRunner;
 
 /// The main model containing all UI state
 pub struct Model {
     pub runner: WorkloadRunner,
     pub metrics: Metrics,
     pub progress_pct: f64,
-    pub initial_usage: Usage,
-    pub latest_usage: Usage,
-    pub usage_diff_from_start: Usage,
+    pub usage_cost: UsageCostState,
+    pub progress: ProgressWidgetState,
     pub latency_state: LatencyState,
     pub performance_state: PerformanceState,
     pub error_state: ErrorState,
-    pub workload_modal_state: WorkloadModalState,
 }
 
 impl Model {
@@ -44,13 +40,15 @@ impl Model {
             runner,
             metrics: Metrics::default(),
             progress_pct: 0.0,
-            initial_usage: Usage::default(),
-            latest_usage: Usage::default(),
-            usage_diff_from_start: Usage::default(),
+            usage_cost: UsageCostState::default(),
+            progress: ProgressWidgetState {
+                completed: 0,
+                total: 0,
+                pct: 0.0,
+            },
             latency_state: LatencyState::new(),
             performance_state: PerformanceState::new(),
             error_state: ErrorState::new(),
-            workload_modal_state: WorkloadModalState::new(),
         }
     }
 }
@@ -97,7 +95,7 @@ impl Metrics {
 }
 
 /// The main UI function that renders all components
-pub fn draw(f: &mut Frame, model: &Model) {
+pub fn draw(f: &mut Frame, model: &mut Model) {
     // Calculate available height after fixed sections
     let total_height = f.area().height.saturating_sub(2); // Account for margin
     let fixed_height = 3 + 12 + 12 + 1; // Progress + Errors + Usage & Cost + Quit message
@@ -139,7 +137,7 @@ pub fn draw(f: &mut Frame, model: &Model) {
         .split(f.area());
 
     // Render each component
-    f.render_widget(ProgressWidget::new(model), chunks[0]);
+    f.render_stateful_widget(ProgressWidget, chunks[0], &mut model.progress);
 
     // Use the new stateful performance widget with chart
     let performance_widget = PerformanceWidget::new(&model.performance_state);
@@ -153,7 +151,7 @@ pub fn draw(f: &mut Frame, model: &Model) {
     let error_widget = ErrorWidget::new(&model.error_state);
     error_widget.render_with_chart(chunks[3], f.buffer_mut());
 
-    f.render_widget(UsageCostWidget::new(model), chunks[4]);
+    f.render_stateful_widget(UsageCostWidget, chunks[4], &mut model.usage_cost);
 
     // Render quit message at the bottom without borders
     let quit_msg = ratatui::widgets::Paragraph::new(
@@ -166,10 +164,4 @@ pub fn draw(f: &mut Frame, model: &Model) {
     )
     .alignment(ratatui::layout::Alignment::Center);
     f.render_widget(quit_msg, chunks[5]);
-
-    // Render the workload modal if visible
-    if model.workload_modal_state.visible {
-        let workload_modal = WorkloadModalWidget::new(&model.workload_modal_state);
-        workload_modal.render(f.area(), f.buffer_mut(), &model.runner);
-    }
 }

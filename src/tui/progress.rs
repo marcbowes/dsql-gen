@@ -5,31 +5,26 @@ use ratatui::{
     widgets::{Block, Borders, Gauge},
 };
 
-use crate::tui::Model;
+pub struct ProgressWidgetState {
+    pub completed: usize,
+    pub total: usize,
+    pub pct: f64,
+}
 
 /// Widget for displaying the progress bar
-pub struct ProgressWidget<'a> {
-    model: &'a Model,
-}
+pub struct ProgressWidget;
 
-impl<'a> ProgressWidget<'a> {
-    /// Create a new progress widget with the given model
-    pub fn new(model: &'a Model) -> Self {
-        Self { model }
-    }
-}
+impl StatefulWidget for ProgressWidget {
+    type State = ProgressWidgetState;
 
-impl<'a> Widget for ProgressWidget<'a> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+    fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let progress_gauge = Gauge::default()
             .block(Block::default().title("Progress").borders(Borders::ALL))
             .gauge_style(Style::default().fg(Color::Cyan))
-            .percent(self.model.progress_pct as u16)
+            .percent(state.pct as u16)
             .label(format!(
                 "{}/{} ({:.1}%)",
-                self.model.metrics.completed_batches,
-                self.model.runner.batches(),
-                self.model.progress_pct
+                state.completed, state.total, state.pct
             ));
 
         progress_gauge.render(area, buf);

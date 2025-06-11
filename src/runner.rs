@@ -12,11 +12,13 @@ use tokio_retry::strategy::{jitter, ExponentialBackoff};
 
 use crate::events::{Message, QueryErr, QueryOk, QueryResult};
 use crate::pool::{Bundle, ConnectionPool, PoolConfig};
-use crate::workload::{self, Workload};
+use crate::workloads::{Inserts, Workload};
+
+pub type SharedWorkload = Arc<dyn Workload<T = Inserts> + Send + Sync + 'static>;
 
 pub struct WorkloadRunner {
     pub pool: ConnectionPool,
-    workload: Workload,
+    workload: SharedWorkload,
     concurrency: Arc<AtomicUsize>,
     batches: Arc<AtomicUsize>,
     tx: mpsc::Sender<Message>,
@@ -28,18 +30,11 @@ impl WorkloadRunner {
         endpoint: String,
         user: String,
         sdk_config: SdkConfig,
-        workload_name: String,
-        rows: usize,
+        workload: SharedWorkload,
         concurrency: NonZero<usize>,
         batches: usize,
         tx: mpsc::Sender<Message>,
     ) -> Result<Self> {
-        let workloads = workload::load_all(rows);
-        let workload = workloads
-            .get(&workload_name)
-            .ok_or_else(|| anyhow::anyhow!("unknown workload"))?
-            .clone();
-
         let mut config = tokio_postgres::Config::new();
         config.host(endpoint);
         config.user(user);
@@ -66,10 +61,10 @@ impl WorkloadRunner {
         });
 
         {
-            tracing::info!(setup = %workload.setup, "will setup schema");
+            tracing::info!("will setup schema");
             let conn = pool.borrow().await;
             tracing::info!("connection acquired");
-            _ = conn.execute(&workload.setup, &[]).await?;
+            workload.setup(conn).await?;
             tracing::info!("schema ready");
         }
 
@@ -123,11 +118,10 @@ impl WorkloadRunner {
                     .load(Ordering::SeqCst)
                     .saturating_sub(complete + set.len());
                 if remaining > 0 {
-                    set.spawn(execute_batch_with_retry(
-                        pool.clone(),
-                        workload.clone(),
-                        tx.clone(),
-                    ));
+                    set.spawn(
+                        InsertsExecutor(workload.clone())
+                            .execute_batch_with_retry(pool.clone(), tx.clone()),
+                    );
                 }
             }
 
@@ -155,51 +149,51 @@ impl WorkloadRunner {
     }
 }
 
-/// Execute a batch with retry logic
-async fn execute_batch_with_retry(
-    pool: ConnectionPool,
-    workload: Workload,
-    tx: mpsc::Sender<Message>,
-) -> bool {
-    let retry_strategy = ExponentialBackoff::from_millis(10).map(jitter);
-    for backoff in retry_strategy {
-        let start = Instant::now();
+#[derive(Clone)]
+struct InsertsExecutor(SharedWorkload);
 
-        match attempt(pool.clone(), workload.clone()).await {
-            Ok(_) => {
-                _ = tx
-                    .send(Message::QueryResult(QueryResult::Ok(QueryOk {
-                        duration: start.elapsed(),
-                        rows_inserted: workload.rows_inserted,
-                        per_row_logical_bytes_written: workload.per_row_logical_bytes_written,
-                    })))
-                    .await;
-                return true;
-            }
-            Err(err) => {
-                if tx
-                    .send(Message::QueryResult(QueryResult::Err(QueryErr {
-                        duration: start.elapsed(),
-                        msg: err.to_string(),
-                    })))
-                    .await
-                    .is_err()
-                {
-                    return false;
+impl InsertsExecutor {
+    /// Execute a batch with retry logic
+    async fn execute_batch_with_retry(
+        self,
+        pool: ConnectionPool,
+        tx: mpsc::Sender<Message>,
+    ) -> bool {
+        let retry_strategy = ExponentialBackoff::from_millis(10).map(jitter);
+        for backoff in retry_strategy {
+            let start = Instant::now();
+
+            match self.clone().attempt(pool.clone()).await {
+                Ok(inserts) => {
+                    _ = tx
+                        .send(Message::QueryResult(QueryResult::Ok(QueryOk {
+                            duration: start.elapsed(),
+                            rows_inserted: inserts.rows_inserted,
+                            logical_bytes_written: inserts.logical_bytes_written,
+                        })))
+                        .await;
+                    return true;
+                }
+                Err(err) => {
+                    if tx
+                        .send(Message::QueryResult(QueryResult::Err(QueryErr {
+                            duration: start.elapsed(),
+                            msg: err.to_string(),
+                        })))
+                        .await
+                        .is_err()
+                    {
+                        return false;
+                    }
                 }
             }
+            sleep(backoff).await;
         }
-        sleep(backoff).await;
+        false
     }
-    false
-}
 
-async fn attempt(pool: ConnectionPool, workload: Workload) -> Result<()> {
-    let client = pool.borrow().await;
-    let statement = client
-        .statement("payload", workload.single_statement)
-        .await?;
-    _ = client.execute(&statement, &[]).await?;
-
-    Ok(())
+    async fn attempt(self, pool: ConnectionPool) -> Result<Inserts> {
+        let client = pool.borrow().await;
+        self.0.transaction(client).await
+    }
 }

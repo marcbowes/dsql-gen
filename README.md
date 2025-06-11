@@ -6,10 +6,7 @@ A Rust load generator for AWS DSQL with a terminal UI for real-time monitoring. 
 
 ```bash
 # Run a workload
-cargo run --release -- run \
-  --identifier your-cluster-id \
-  --workload tiny \
-  --batches 10 \
-  --concurrency 1 \
-  --rows 1
+cargo run --release -- workload --identifier your-cluster-id \
+  --batches 10 --concurrency 1 \
+  tiny --rows-per-transaction 1
 ```

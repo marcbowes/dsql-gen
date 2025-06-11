@@ -6,25 +6,23 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Row, Table},
 };
 
-use crate::tui::Model;
+use crate::usage::Usage;
+
+#[derive(Default)]
+pub struct UsageCostState {
+    pub initial: Usage,
+    pub latest: Usage,
+}
 
 /// Widget for displaying usage and cost information
-pub struct UsageCostWidget<'a> {
-    model: &'a Model,
-}
+pub struct UsageCostWidget;
 
-impl<'a> UsageCostWidget<'a> {
-    /// Create a new usage & cost widget with the given model
-    pub fn new(model: &'a Model) -> Self {
-        Self { model }
-    }
-}
+impl StatefulWidget for UsageCostWidget {
+    type State = UsageCostState;
 
-impl<'a> Widget for UsageCostWidget<'a> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let m = &self.model.metrics;
-        let latest_usage = &self.model.latest_usage;
-        let usage_diff_from_start = &self.model.usage_diff_from_start;
+    fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
+        let latest_usage = state.latest;
+        let usage_diff_from_start = state.latest - state.initial;
 
         // Format storage sizes
         let storage_current = Byte::from_u64(latest_usage.storage_metrics.size_bytes as u64)
@@ -146,15 +144,8 @@ impl<'a> Widget for UsageCostWidget<'a> {
             ]),
         ];
 
-        let title = if m.completed_batches >= self.model.runner.batches() {
-            "Usage & Cost - waiting for final values"
-        } else {
-            "Usage & Cost"
-        };
-        let mut block = Block::default().title(title).borders(Borders::ALL);
-        if m.completed_batches >= self.model.runner.batches() {
-            block = block.title_style(Style::default().add_modifier(Modifier::RAPID_BLINK));
-        }
+        let title = "Usage & Cost";
+        let block = Block::default().title(title).borders(Borders::ALL);
 
         let widths = [
             Constraint::Length(12),

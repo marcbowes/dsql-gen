@@ -82,7 +82,7 @@ impl<'a> PerformanceWidget<'a> {
         let rps = data.iter().map(|ok| ok.value.rows_inserted).sum::<usize>() as f64 / secs as f64;
         let bps = data
             .iter()
-            .map(|ok| ok.value.rows_inserted * ok.value.per_row_logical_bytes_written)
+            .map(|ok| ok.value.logical_bytes_written)
             .sum::<usize>() as f64
             / secs as f64;
         let bps_unit = Byte::from(bps as u64).get_appropriate_unit(UnitType::Binary);
