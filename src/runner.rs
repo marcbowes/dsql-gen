@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use aws_config::SdkConfig;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
@@ -15,10 +16,11 @@ use crate::pool::{Bundle, ConnectionPool, PoolConfig};
 use crate::workloads::{Inserts, Workload};
 
 pub type SharedWorkload = Arc<dyn Workload<T = Inserts> + Send + Sync + 'static>;
+pub type SharedExecutor = Arc<dyn BatchExecutor + Send + Sync + 'static>;
 
 pub struct WorkloadRunner {
     pub pool: ConnectionPool,
-    workload: SharedWorkload,
+    executor: SharedExecutor,
     concurrency: Arc<AtomicUsize>,
     batches: Arc<AtomicUsize>,
     tx: mpsc::Sender<Message>,
@@ -31,6 +33,7 @@ impl WorkloadRunner {
         user: String,
         sdk_config: SdkConfig,
         workload: SharedWorkload,
+        executor: SharedExecutor,
         concurrency: NonZero<usize>,
         batches: usize,
         tx: mpsc::Sender<Message>,
@@ -73,7 +76,7 @@ impl WorkloadRunner {
 
         Ok(Self {
             pool,
-            workload,
+            executor,
             concurrency,
             batches,
             tx,
@@ -84,7 +87,7 @@ impl WorkloadRunner {
         let concurrency = self.concurrency.clone();
         let batches = self.batches.clone();
         let pool = self.pool.clone();
-        let workload = self.workload.clone();
+        let executor = self.executor.clone();
         let tx = self.tx.clone();
 
         tokio::spawn(async move {
@@ -119,7 +122,8 @@ impl WorkloadRunner {
                     .saturating_sub(complete + set.len());
                 if remaining > 0 {
                     set.spawn(
-                        InsertsExecutor(workload.clone())
+                        executor
+                            .clone()
                             .execute_batch_with_retry(pool.clone(), tx.clone()),
                     );
                 }
@@ -149,13 +153,30 @@ impl WorkloadRunner {
     }
 }
 
+#[async_trait]
+pub trait BatchExecutor {
+    async fn execute_batch_with_retry(
+        self: Arc<Self>,
+        pool: ConnectionPool,
+        tx: mpsc::Sender<Message>,
+    ) -> bool;
+}
+
 #[derive(Clone)]
-struct InsertsExecutor(SharedWorkload);
+pub struct InsertsExecutor(pub SharedWorkload);
 
 impl InsertsExecutor {
+    async fn attempt(&self, pool: ConnectionPool) -> Result<Inserts> {
+        let client = pool.borrow().await;
+        self.0.transaction(client).await
+    }
+}
+
+#[async_trait]
+impl BatchExecutor for InsertsExecutor {
     /// Execute a batch with retry logic
     async fn execute_batch_with_retry(
-        self,
+        self: Arc<Self>,
         pool: ConnectionPool,
         tx: mpsc::Sender<Message>,
     ) -> bool {
@@ -163,7 +184,7 @@ impl InsertsExecutor {
         for backoff in retry_strategy {
             let start = Instant::now();
 
-            match self.clone().attempt(pool.clone()).await {
+            match self.attempt(pool.clone()).await {
                 Ok(inserts) => {
                     _ = tx
                         .send(Message::QueryResult(QueryResult::Ok(QueryOk {
@@ -190,10 +211,5 @@ impl InsertsExecutor {
             sleep(backoff).await;
         }
         false
-    }
-
-    async fn attempt(self, pool: ConnectionPool) -> Result<Inserts> {
-        let client = pool.borrow().await;
-        self.0.transaction(client).await
     }
 }

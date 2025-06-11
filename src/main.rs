@@ -6,12 +6,13 @@ use anyhow::{anyhow, Result};
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use clap::Parser;
 use dsql_gen::events::Message;
+use dsql_gen::workloads::counter::{Counter, CounterArgs};
 use dsql_gen::workloads::onekib::{OneKibRows, OneKibRowsArgs};
 use dsql_gen::workloads::tiny::{TinyRows, TinyRowsArgs};
 use tokio::sync::mpsc;
 use tokio::task::{self, JoinHandle};
 
-use dsql_gen::runner::{SharedWorkload, WorkloadRunner};
+use dsql_gen::runner::{InsertsExecutor, SharedExecutor, SharedWorkload, WorkloadRunner};
 use dsql_gen::ui::MonitorUI;
 use dsql_gen::usage::{self, Usage, UsageCalculator};
 use tracing::Level;
@@ -75,13 +76,25 @@ enum WorkloadCommands {
     Tiny(TinyRowsArgs),
     /// Run the 1KiB insert workload
     OneKib(OneKibRowsArgs),
+    /// Run the counter workload
+    Counter(CounterArgs),
 }
 
 impl WorkloadCommands {
-    fn to_workload(&self) -> SharedWorkload {
+    fn build(&self) -> (SharedWorkload, SharedExecutor) {
         match self {
-            WorkloadCommands::Tiny(args) => Arc::new(TinyRows::new(args.clone())),
-            WorkloadCommands::OneKib(args) => Arc::new(OneKibRows::new(args.clone())),
+            WorkloadCommands::Tiny(args) => {
+                let w = Arc::new(TinyRows::new(args.clone()));
+                (w.clone(), Arc::new(InsertsExecutor(w)))
+            }
+            WorkloadCommands::OneKib(args) => {
+                let w = Arc::new(OneKibRows::new(args.clone()));
+                (w.clone(), Arc::new(InsertsExecutor(w)))
+            }
+            WorkloadCommands::Counter(args) => {
+                let w = Arc::new(Counter::new(args.clone()));
+                (w.clone(), Arc::new(InsertsExecutor(w)))
+            }
         }
     }
 }
@@ -135,7 +148,7 @@ struct UsageArgs {
 async fn run_load_generator(args: WorkloadArgs) -> Result<()> {
     let sdk_config = args.sdk_config().await;
 
-    let workload = args.workload.to_workload();
+    let (workload, executor) = args.workload.build();
 
     let (tx, rx) = mpsc::channel(1000);
 
@@ -147,6 +160,7 @@ async fn run_load_generator(args: WorkloadArgs) -> Result<()> {
         args.user,
         sdk_config,
         workload,
+        executor,
         NonZero::new(args.concurrency).ok_or_else(|| anyhow!("concurrency must be non-zero"))?,
         args.batches,
         tx.clone(),
