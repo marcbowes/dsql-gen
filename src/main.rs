@@ -26,8 +26,26 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// AWS DSQL cluster ID
+    #[arg(short, long)]
+    identifier: String,
+
+    /// AWS region
+    #[arg(short, long, env = "AWS_REGION")]
+    region: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
+}
+
+impl Args {
+    async fn sdk_config(&self) -> SdkConfig {
+        let mut loader = aws_config::defaults(BehaviorVersion::latest());
+        if let Some(r) = &self.region {
+            loader = loader.region(Region::new(r.clone()));
+        }
+        loader.load().await
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -40,10 +58,6 @@ enum Commands {
 
 #[derive(Parser, Debug)]
 struct WorkloadArgs {
-    /// AWS DSQL cluster ID
-    #[arg(short, long)]
-    identifier: String,
-
     /// An optional endpoint override to use. The endpoint is usually
     /// automatically built from the identifier and region.
     #[arg(short, long)]
@@ -52,10 +66,6 @@ struct WorkloadArgs {
     /// DB user
     #[arg(short, long, default_value = "admin")]
     user: String,
-
-    /// AWS region
-    #[arg(short, long, env = "AWS_REGION")]
-    region: Option<String>,
 
     /// Number of concurrent connections
     #[arg(short, long, default_value_t = 10)]
@@ -104,7 +114,7 @@ impl WorkloadCommands {
 }
 
 impl WorkloadArgs {
-    fn endpoint(&self, sdk_config: &SdkConfig) -> Result<String> {
+    fn endpoint(&self, identifier: impl AsRef<str>, sdk_config: &SdkConfig) -> Result<String> {
         if let Some(endpoint) = &self.endpoint {
             return Ok(endpoint.clone());
         }
@@ -114,53 +124,29 @@ impl WorkloadArgs {
             .ok_or_else(|| anyhow!("no region set"))?;
         Ok(format!(
             "{}.dsql.{}.on.aws",
-            self.identifier,
+            identifier.as_ref(),
             region.as_ref()
         ))
-    }
-
-    async fn sdk_config(&self) -> SdkConfig {
-        let mut loader = aws_config::defaults(BehaviorVersion::latest());
-        if let Some(r) = &self.region {
-            loader = loader.region(Region::new(r.clone()));
-        }
-        loader.load().await
-    }
-}
-
-impl UsageArgs {
-    async fn sdk_config(&self) -> SdkConfig {
-        let mut loader = aws_config::defaults(BehaviorVersion::latest());
-        if let Some(r) = &self.region {
-            loader = loader.region(Region::new(r.clone()));
-        }
-        loader.load().await
     }
 }
 
 #[derive(Parser, Debug)]
-struct UsageArgs {
-    /// AWS DSQL cluster ID
-    #[arg(short, long)]
+struct UsageArgs;
+
+async fn run_load_generator(
     identifier: String,
-
-    /// AWS region
-    #[arg(short, long, env = "AWS_REGION")]
-    region: Option<String>,
-}
-
-async fn run_load_generator(args: WorkloadArgs) -> Result<()> {
-    let sdk_config = args.sdk_config().await;
-
+    sdk_config: SdkConfig,
+    args: WorkloadArgs,
+) -> Result<()> {
     let (workload, executor) = args.workload.build();
 
     let (tx, rx) = mpsc::channel(1000);
 
-    let calc = UsageCalculator::new(args.identifier.clone(), &sdk_config);
+    let calc = UsageCalculator::new(identifier.clone(), &sdk_config);
 
     // Create the workload runner
     let runner = WorkloadRunner::new(
-        args.endpoint(&sdk_config)?,
+        args.endpoint(&identifier, &sdk_config)?,
         args.user,
         sdk_config,
         workload,
@@ -213,14 +199,14 @@ async fn run_load_generator(args: WorkloadArgs) -> Result<()> {
     Ok(())
 }
 
-async fn print_cluster_usage(args: UsageArgs) -> anyhow::Result<()> {
-    let sdk_config = args.sdk_config().await;
-    let cal = UsageCalculator::new(args.identifier.clone(), &sdk_config);
+async fn print_cluster_usage(
+    identifier: String,
+    sdk_config: SdkConfig,
+    _args: UsageArgs,
+) -> anyhow::Result<()> {
+    let cal = UsageCalculator::new(identifier.clone(), &sdk_config);
 
-    println!(
-        "Fetching usage information for cluster: {}",
-        args.identifier
-    );
+    println!("Fetching usage information for cluster: {identifier}");
 
     let dpu_metrics = cal.dpus_this_month().await?;
     let storage_metrics = cal.current_storage_usage().await?;
@@ -251,10 +237,15 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let sdk_config = args.sdk_config().await;
 
     match args.command {
-        Commands::Workload(run_args) => run_load_generator(run_args).await?,
-        Commands::Usage(print_args) => print_cluster_usage(print_args).await?,
+        Commands::Workload(run_args) => {
+            run_load_generator(args.identifier, sdk_config, run_args).await?
+        }
+        Commands::Usage(print_args) => {
+            print_cluster_usage(args.identifier, sdk_config, print_args).await?
+        }
     }
 
     Ok(())
