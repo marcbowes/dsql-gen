@@ -19,6 +19,10 @@ use tracing::Level;
 use tracing_appender::non_blocking::NonBlocking;
 use tracing_subscriber::EnvFilter;
 
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {

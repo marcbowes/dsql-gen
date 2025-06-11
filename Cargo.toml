@@ -24,3 +24,9 @@ postgres-native-tls = "0.5.1"
 tokio-postgres = "0.7.13"
 native-tls = { version = "0.2.14", features = ["alpn"] }
 async-trait = "0.1.88"
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6.0", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+
+[profile.release]
+debug = 1
