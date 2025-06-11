@@ -24,9 +24,9 @@ pub struct Bundle {
 }
 
 impl Bundle {
-    pub fn new_with_sdk_config(config: Config, sdk_config: SdkConfig) -> Result<Bundle> {
-        let endpoint = match config.get_hosts() {
-            [tokio_postgres::config::Host::Tcp(hostname)] => hostname,
+    pub fn new_with_sdk_config(mut config: Config, sdk_config: SdkConfig) -> Result<Bundle> {
+        let endpoint = match &config.get_hosts() {
+            [tokio_postgres::config::Host::Tcp(hostname)] => hostname.clone(),
             _ => bail!("you must specify precisely one host by hostname"),
         };
 
@@ -34,10 +34,23 @@ impl Bundle {
             bail!("you must specify a user");
         }
 
-        let connector = native_tls::TlsConnector::builder()
-            .request_alpns(&["postgresql"])
-            .build()?;
-        let connector = postgres_native_tls::MakeTlsConnector::new(connector);
+        // FIXME: Temporary hack for testing against rds
+        let connector = if let Ok(pgpass) = std::env::var("PGPASSWORD") {
+            config.password(pgpass);
+            config.ssl_negotiation(tokio_postgres::config::SslNegotiation::Postgres);
+
+            let connector = native_tls::TlsConnector::builder()
+                .danger_accept_invalid_certs(true)
+                .build()?;
+            let connector = postgres_native_tls::MakeTlsConnector::new(connector);
+            connector
+        } else {
+            let connector = native_tls::TlsConnector::builder()
+                .request_alpns(&["postgresql"])
+                .build()?;
+            let connector = postgres_native_tls::MakeTlsConnector::new(connector);
+            connector
+        };
 
         let signer = AuthTokenGenerator::new(
             auth_token::Config::builder()
