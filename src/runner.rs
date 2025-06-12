@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
+use async_rate_limiter::RateLimiter;
 use async_trait::async_trait;
 use aws_config::SdkConfig;
 use tokio::sync::mpsc;
@@ -46,11 +47,14 @@ impl WorkloadRunner {
         config.ssl_negotiation(tokio_postgres::config::SslNegotiation::Direct);
 
         tracing::info!("launching pool");
+        let rate_limiter = RateLimiter::new(10);
+        rate_limiter.burst(1000);
         let (pool, mut telemetry) = ConnectionPool::launch(
             Bundle::new_with_sdk_config(config, sdk_config)?,
             PoolConfig {
                 desired: concurrency,
                 concurrent: concurrency,
+                rate_limiter,
             },
         )
         .await?;

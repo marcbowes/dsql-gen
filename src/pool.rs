@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fmt::Debug,
+    fmt::{self, Debug},
     num::NonZero,
     ops::{Deref, DerefMut},
     sync::Arc,
@@ -8,8 +8,13 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Result};
+use async_rate_limiter::RateLimiter;
 use aws_config::SdkConfig;
 use aws_sdk_dsql::auth_token::{self, AuthTokenGenerator};
+use futures::{
+    future::{FusedFuture, OptionFuture},
+    FutureExt,
+};
 use tokio::{
     sync::{mpsc, Mutex},
     task::JoinSet,
@@ -169,10 +174,20 @@ pub enum Telemetry {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PoolConfig {
     pub desired: NonZero<usize>,
     pub concurrent: NonZero<usize>,
+    pub rate_limiter: RateLimiter,
+}
+
+impl fmt::Debug for PoolConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PoolConfig")
+            .field("desired", &self.desired)
+            .field("concurrent", &self.concurrent)
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -255,18 +270,24 @@ async fn maintain(
 
     loop {
         // first launch any reconnect attempts we need
-        while inflight + connected < config.desired.get() && inflight < config.concurrent.get() {
-            inflight += 1;
-            let _b = bundle.clone();
-            connecting.spawn(async move {
-                let start = Instant::now();
-                (_b.connect().await, start.elapsed())
-            });
-        }
+        let launch =
+            if inflight + connected < config.desired.get() && inflight < config.concurrent.get() {
+                OptionFuture::from(Some(config.rate_limiter.acquire().fuse()))
+            } else {
+                OptionFuture::from(None)
+            };
 
         // now watch for events - either from the `drop` queue returning or
         // notifying of a connection failure or from one of our connect attempts
         tokio::select! {
+            _ = launch, if !launch.is_terminated() => {
+                inflight += 1;
+                let _b = bundle.clone();
+                connecting.spawn(async move {
+                    let start = Instant::now();
+                    (_b.connect().await, start.elapsed())
+                });
+            }
             handle = connecting.join_next(), if !connecting.is_empty() => {
                 inflight -= 1;
                 match handle.expect("a task")? {
