@@ -248,7 +248,7 @@ struct PoolInner {
 impl PoolInner {
     pub async fn borrow(&mut self) -> ClientHandle {
         ClientHandle {
-            client: self.obtain.recv().await,
+            client: Some(self.obtain.recv().await.expect("pool hasn't crashed")),
             release: self.release.clone(),
         }
     }
@@ -319,6 +319,8 @@ async fn maintain(
             }
         }
     }
+
+    tracing::info!("pool exiting");
 
     Ok(())
 }
