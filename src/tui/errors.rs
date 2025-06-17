@@ -12,8 +12,8 @@ use ratatui::{
 };
 
 use crate::history::{
+    bucketing::{bucket_data, BucketConfig},
     TimestampedHistory,
-    bucketing::{BucketConfig, bucket_data},
 };
 
 use super::ErrorEntry;
@@ -49,6 +49,8 @@ impl ErrorState {
 
     /// Record an error message from a batch failure
     pub fn record_error(&mut self, error_message: String) {
+        tracing::error!("{error_message}");
+
         self.error_count += 1;
 
         // Add to recent errors list
@@ -177,14 +179,12 @@ impl<'a> ErrorWidget<'a> {
         max_errors = (max_errors * 1.1).max(1.0);
 
         // Create dataset
-        let datasets = vec![
-            Dataset::default()
-                .name("Errors/sec")
-                .marker(symbols::Marker::Dot)
-                .graph_type(GraphType::Line)
-                .style(Style::default().fg(Color::Red))
-                .data(&error_data),
-        ];
+        let datasets = vec![Dataset::default()
+            .name("Errors/sec")
+            .marker(symbols::Marker::Dot)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Red))
+            .data(&error_data)];
 
         // Calculate X-axis labels (time)
         let x_labels = vec![
