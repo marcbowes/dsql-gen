@@ -9,6 +9,7 @@ use dsql_gen::events::Message;
 use dsql_gen::workloads::counter::{Counter, CounterArgs};
 use dsql_gen::workloads::onekib::{OneKibRows, OneKibRowsArgs};
 use dsql_gen::workloads::tiny::{TinyRows, TinyRowsArgs};
+use dsql_gen::workloads::tpcb::{Tpcb, TpcbArgs};
 use tokio::sync::mpsc;
 use tokio::task::{self, JoinHandle};
 
@@ -100,6 +101,8 @@ enum WorkloadCommands {
     OneKib(OneKibRowsArgs),
     /// Run the counter workload
     Counter(CounterArgs),
+    /// Run the TPC-B workload
+    Tpcb(TpcbArgs),
 }
 
 impl WorkloadCommands {
@@ -115,6 +118,10 @@ impl WorkloadCommands {
             }
             WorkloadCommands::Counter(args) => {
                 let w = Arc::new(Counter::new(args.clone()));
+                (w.clone(), Arc::new(InsertsExecutor(w)))
+            }
+            WorkloadCommands::Tpcb(args) => {
+                let w = Arc::new(Tpcb::new(args.clone()));
                 (w.clone(), Arc::new(InsertsExecutor(w)))
             }
         }

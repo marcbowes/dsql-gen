@@ -6,6 +6,7 @@ use crate::pool::ClientHandle;
 pub mod counter;
 pub mod onekib;
 pub mod tiny;
+pub mod tpcb;
 
 pub struct Inserts {
     pub rows_inserted: usize,
