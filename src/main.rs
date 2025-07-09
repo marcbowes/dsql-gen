@@ -2,7 +2,7 @@ use std::fs::File;
 use std::num::NonZero;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use clap::Parser;
 use dsql_gen::events::Message;
@@ -82,6 +82,10 @@ struct WorkloadArgs {
     /// Workload to run
     #[command(subcommand)]
     workload: WorkloadCommands,
+
+    /// Always rollback transactions (used for specific testing scenarios)
+    #[arg(long, default_value_t = false)]
+    always_rollback: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -154,6 +158,7 @@ async fn run_load_generator(
         NonZero::new(args.concurrency).ok_or_else(|| anyhow!("concurrency must be non-zero"))?,
         args.batches,
         tx.clone(),
+        args.always_rollback,
     )
     .await?;
 

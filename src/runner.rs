@@ -1,6 +1,6 @@
 use std::num::NonZero;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -10,7 +10,7 @@ use aws_config::SdkConfig;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::sleep;
-use tokio_retry::strategy::{jitter, ExponentialBackoff};
+use tokio_retry::strategy::{ExponentialBackoff, jitter};
 
 use crate::events::{Message, QueryErr, QueryOk, QueryResult};
 use crate::pool::{Bundle, ConnectionPool, PoolConfig};
@@ -25,6 +25,7 @@ pub struct WorkloadRunner {
     concurrency: Arc<AtomicUsize>,
     batches: Arc<AtomicUsize>,
     tx: mpsc::Sender<Message>,
+    always_rollback: bool,
 }
 
 impl WorkloadRunner {
@@ -38,6 +39,7 @@ impl WorkloadRunner {
         concurrency: NonZero<usize>,
         batches: usize,
         tx: mpsc::Sender<Message>,
+        always_rollback: bool,
     ) -> Result<Self> {
         let mut config = tokio_postgres::Config::new();
         config.host(endpoint);
@@ -84,6 +86,7 @@ impl WorkloadRunner {
             concurrency,
             batches,
             tx,
+            always_rollback,
         })
     }
 
@@ -93,6 +96,7 @@ impl WorkloadRunner {
         let pool = self.pool.clone();
         let executor = self.executor.clone();
         let tx = self.tx.clone();
+        let always_rollback = self.always_rollback;
 
         tokio::spawn(async move {
             let mut set = JoinSet::new();
@@ -125,11 +129,11 @@ impl WorkloadRunner {
                     .load(Ordering::SeqCst)
                     .saturating_sub(complete + set.len());
                 if remaining > 0 {
-                    set.spawn(
-                        executor
-                            .clone()
-                            .execute_batch_with_retry(pool.clone(), tx.clone()),
-                    );
+                    set.spawn(executor.clone().execute_batch_with_retry(
+                        pool.clone(),
+                        tx.clone(),
+                        always_rollback,
+                    ));
                 }
             }
 
@@ -163,6 +167,7 @@ pub trait BatchExecutor {
         self: Arc<Self>,
         pool: ConnectionPool,
         tx: mpsc::Sender<Message>,
+        always_rollback: bool,
     ) -> bool;
 }
 
@@ -170,9 +175,29 @@ pub trait BatchExecutor {
 pub struct InsertsExecutor(pub SharedWorkload);
 
 impl InsertsExecutor {
-    async fn attempt(&self, pool: ConnectionPool) -> Result<Inserts> {
+    async fn attempt(&self, pool: ConnectionPool, always_rollback: bool) -> Result<Inserts> {
         let client = pool.borrow().await;
-        self.0.transaction(client).await
+
+        client.execute("BEGIN", &[]).await?;
+
+        let result = match self.0.transaction(&client).await {
+            Ok(inserts) => {
+                // Transaction succeeded, commit or rollback based on flag
+                if always_rollback {
+                    client.execute("ROLLBACK", &[]).await?;
+                } else {
+                    client.execute("COMMIT", &[]).await?;
+                }
+                Ok(inserts)
+            }
+            Err(e) => {
+                // Transaction failed, always rollback
+                let _ = client.execute("ROLLBACK", &[]).await; // Ignore rollback errors
+                Err(e)
+            }
+        };
+
+        result
     }
 }
 
@@ -183,12 +208,13 @@ impl BatchExecutor for InsertsExecutor {
         self: Arc<Self>,
         pool: ConnectionPool,
         tx: mpsc::Sender<Message>,
+        always_rollback: bool,
     ) -> bool {
         let retry_strategy = ExponentialBackoff::from_millis(10).map(jitter);
         for backoff in retry_strategy {
             let start = Instant::now();
 
-            match self.attempt(pool.clone()).await {
+            match self.attempt(pool.clone(), always_rollback).await {
                 Ok(inserts) => {
                     _ = tx
                         .send(Message::QueryResult(QueryResult::Ok(QueryOk {

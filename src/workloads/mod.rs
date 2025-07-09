@@ -17,5 +17,5 @@ pub trait Workload {
     type T;
 
     async fn setup(&self, client: ClientHandle) -> Result<()>;
-    async fn transaction(&self, client: ClientHandle) -> Result<Self::T>;
+    async fn transaction(&self, client: &ClientHandle) -> Result<Self::T>;
 }
