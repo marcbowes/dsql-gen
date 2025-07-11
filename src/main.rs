@@ -193,7 +193,25 @@ async fn run_load_generator(
 
     if args.no_ui {
         // Run in headless mode
-        let mut headless = HeadlessMonitor::new(rx);
+        let rows_per_tx = match &args.workload {
+            WorkloadCommands::Tiny(tiny_args) => Some(tiny_args.rows_per_transaction),
+            WorkloadCommands::OneKib(onekib_args) => Some(onekib_args.rows_per_transaction),
+            WorkloadCommands::Counter(_) => None, // Counter doesn't have rows_per_transaction
+        };
+
+        let workload_name = match &args.workload {
+            WorkloadCommands::Tiny(_) => "tiny".to_string(),
+            WorkloadCommands::OneKib(_) => "onekib".to_string(),
+            WorkloadCommands::Counter(_) => "counter".to_string(),
+        };
+
+        let mut headless = HeadlessMonitor::new(
+            rx,
+            args.concurrency,
+            rows_per_tx,
+            workload_name,
+            args.always_rollback,
+        );
         headless.run(runner).await?;
         headless.print_final_stats();
 

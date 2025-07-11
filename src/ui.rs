@@ -2,6 +2,7 @@ use std::io::stdout;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use crossterm::{
     ExecutableCommand,
     event::{self, Event, KeyCode, KeyModifiers},
@@ -9,6 +10,7 @@ use crossterm::{
 };
 use hdrhistogram::Histogram;
 use ratatui::prelude::*;
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::time;
 
@@ -98,20 +100,38 @@ pub struct HeadlessMonitor {
     completed_batches: usize,
     error_count: usize,
     start_time: Instant,
+    start_time_utc: DateTime<Utc>,
     total_batches: usize,
     errors: Vec<String>,
+    concurrency: usize,
+    rows_per_transaction: Option<usize>,
+    workload_name: String,
+    always_rollback: bool,
 }
 
 impl HeadlessMonitor {
-    pub fn new(rx: mpsc::Receiver<Message>) -> Self {
+    pub fn new(
+        rx: mpsc::Receiver<Message>,
+        concurrency: usize,
+        rows_per_transaction: Option<usize>,
+        workload_name: String,
+        always_rollback: bool,
+    ) -> Self {
+        let now = Instant::now();
+        let now_utc = Utc::now();
         Self {
             listener: EventListener::new(rx),
             latency_histogram: Histogram::<u64>::new_with_bounds(1, 60_000 * 10, 3).unwrap(),
             completed_batches: 0,
             error_count: 0,
-            start_time: Instant::now(),
+            start_time: now,
+            start_time_utc: now_utc,
             total_batches: 0,
             errors: Vec::new(),
+            concurrency,
+            rows_per_transaction,
+            workload_name,
+            always_rollback,
         }
     }
 
@@ -119,7 +139,17 @@ impl HeadlessMonitor {
         self.total_batches = runner.batches();
         let mut running = runner.spawn();
 
-        println!("Starting workload with {} batches...", self.total_batches);
+        // Output initial configuration as JSON
+        let start_config = json!({
+            "phase": "start",
+            "start_time_utc": self.start_time_utc.to_rfc3339(),
+            "workload": self.workload_name,
+            "total_batches": self.total_batches,
+            "concurrency": self.concurrency,
+            "always_rollback": self.always_rollback,
+            "rows_per_transaction": self.rows_per_transaction,
+        });
+        println!("{}", serde_json::to_string(&start_config)?);
 
         // Process messages until completion
         loop {
@@ -188,48 +218,50 @@ impl HeadlessMonitor {
     pub fn print_final_stats(&self) {
         let duration = self.start_time.elapsed();
         let duration_secs = duration.as_secs_f64();
+        let end_time_utc = Utc::now();
 
-        println!("\n=== Workload Complete! ===");
-        println!("Duration: {:.1}s", duration_secs);
-        println!("Completed Batches: {}", self.completed_batches);
-        println!("Errors: {}", self.error_count);
+        let mut results = json!({
+            "phase": "results",
+            "end_time_utc": end_time_utc.to_rfc3339(),
+            "duration_s": format!("{:.3}", duration_secs),
+            "completed_batches": self.completed_batches,
+            "error_count": self.error_count,
+        });
 
         if self.completed_batches > 0 {
-            println!(
-                "Throughput: {:.1} batches/sec",
+            results["throughput_batches_per_sec"] = json!(format!(
+                "{:.1}",
                 self.completed_batches as f64 / duration_secs
-            );
+            ));
 
             if self.latency_histogram.len() > 0 {
-                println!("Latency Percentiles:");
-                println!(
-                    "  p50:  {:.1}ms",
-                    self.latency_histogram.value_at_quantile(0.5) as f64
-                );
-                println!(
-                    "  p95:  {:.1}ms",
-                    self.latency_histogram.value_at_quantile(0.95) as f64
-                );
-                println!(
-                    "  p99:  {:.1}ms",
-                    self.latency_histogram.value_at_quantile(0.99) as f64
-                );
-                println!(
-                    "  p99.9: {:.1}ms",
-                    self.latency_histogram.value_at_quantile(0.999) as f64
-                );
-                println!("  max:  {:.1}ms", self.latency_histogram.max() as f64);
+                let latency_stats = json!({
+                    "p50_ms": format!("{:.1}", self.latency_histogram.value_at_quantile(0.5) as f64),
+                    "p95_ms": format!("{:.1}", self.latency_histogram.value_at_quantile(0.95) as f64),
+                    "p99_ms": format!("{:.1}", self.latency_histogram.value_at_quantile(0.99) as f64),
+                    "p999_ms": format!("{:.1}", self.latency_histogram.value_at_quantile(0.999) as f64),
+                    "max_ms": format!("{:.1}", self.latency_histogram.max() as f64),
+                    "mean_ms": format!("{:.1}", self.latency_histogram.mean()),
+                    "stddev_ms": format!("{:.1}", self.latency_histogram.stdev()),
+                });
+                results["latency"] = latency_stats;
             }
         }
 
-        if self.error_count > 0 {
-            println!("\nRecent Errors:");
-            for (i, error) in self.errors.iter().rev().take(5).enumerate() {
-                println!("  {}: {}", i + 1, error);
-            }
-            if self.errors.len() > 5 {
-                println!("  ... and {} more errors", self.errors.len() - 5);
-            }
+        // Include errors in the results
+        if self.error_count > 0 && !self.errors.is_empty() {
+            let errors: Vec<String> = self
+                .errors
+                .iter()
+                .take(5)
+                .map(|e| e.replace('\t', " ").replace('\n', " "))
+                .collect();
+            results["errors"] = json!(errors);
+        }
+
+        // Output the final results as JSON
+        if let Ok(json_string) = serde_json::to_string(&results) {
+            println!("{}", json_string);
         }
     }
 }
