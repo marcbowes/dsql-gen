@@ -71,7 +71,7 @@ impl WorkloadRunner {
 
         {
             tracing::info!("will setup schema");
-            let conn = pool.borrow().await;
+            let conn = pool.borrow().await?;
             tracing::info!("connection acquired");
             workload.setup(conn).await?;
             tracing::info!("schema ready");
@@ -176,7 +176,7 @@ pub struct InsertsExecutor(pub SharedWorkload);
 
 impl InsertsExecutor {
     async fn attempt(&self, pool: ConnectionPool, always_rollback: bool) -> Result<Inserts> {
-        let client = pool.borrow().await;
+        let client = pool.borrow().await?;
 
         client.execute("BEGIN", &[]).await?;
 

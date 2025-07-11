@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio::task::{self, JoinHandle};
 
 use dsql_gen::runner::{InsertsExecutor, SharedExecutor, SharedWorkload, WorkloadRunner};
-use dsql_gen::ui::MonitorUI;
+use dsql_gen::ui::{HeadlessMonitor, MonitorUI};
 use dsql_gen::usage::{self, Usage, UsageCalculator};
 use tracing::Level;
 use tracing_appender::non_blocking::NonBlocking;
@@ -86,6 +86,10 @@ struct WorkloadArgs {
     /// Always rollback transactions (used for specific testing scenarios)
     #[arg(long, default_value_t = false)]
     always_rollback: bool,
+
+    /// Run without terminal UI, show final stats only
+    #[arg(long, default_value_t = false)]
+    no_ui: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -162,6 +166,8 @@ async fn run_load_generator(
     )
     .await?;
 
+    let mut usage_task = None::<JoinHandle<Result<()>>>;
+
     if !args.no_usage {
         // make sure this is after the setup runs.
         let initial_usage = calc.get_initial_usage().await?;
@@ -172,24 +178,57 @@ async fn run_load_generator(
         let tx_usage = tx.clone();
         let mut _watch_usage = watch_usage.clone();
         tx_usage.send(Message::InitialUsage(initial_usage)).await?;
-        let _send_usage: JoinHandle<Result<()>> = tokio::spawn(async move {
+        let send_usage_handle: JoinHandle<Result<()>> = tokio::spawn(async move {
             loop {
                 _watch_usage.changed().await?;
                 let usage = *_watch_usage.borrow();
-                tx_usage.send(Message::UsageUpdated(usage)).await?;
+                if tx_usage.send(Message::UsageUpdated(usage)).await.is_err() {
+                    break; // Channel closed, exit loop
+                }
             }
+            Ok(())
         });
+        usage_task = Some(send_usage_handle);
     }
 
-    // Start the UI in a separate task
-    let ui = task::spawn(async move {
-        let mut ui = MonitorUI::new(rx)?;
-        ui.run(runner).await?;
-        anyhow::Ok(())
-    });
+    if args.no_ui {
+        // Run in headless mode
+        let mut headless = HeadlessMonitor::new(rx);
+        headless.run(runner).await?;
+        headless.print_final_stats();
 
-    if let Err(err) = ui.await? {
-        eprintln!("{err:?}");
+        // Cleanup background tasks
+        if let Some(task) = usage_task {
+            task.abort();
+        }
+
+        // Close the message channel to signal all background tasks to exit
+        drop(tx);
+
+        // Give background tasks more time to clean up (network connections need time)
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    } else {
+        // Start the UI in a separate task
+        let ui = task::spawn(async move {
+            let mut ui = MonitorUI::new(rx)?;
+            ui.run(runner).await?;
+            anyhow::Ok(())
+        });
+
+        if let Err(err) = ui.await? {
+            eprintln!("{err:?}");
+        }
+
+        // Cleanup background tasks
+        if let Some(task) = usage_task {
+            task.abort();
+        }
+
+        // Close the message channel to signal all background tasks to exit
+        drop(tx);
+
+        // Give background tasks more time to clean up (network connections need time)
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
     }
 
     // if args.usage {
