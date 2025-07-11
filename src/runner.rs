@@ -101,45 +101,50 @@ impl WorkloadRunner {
         tokio::spawn(async move {
             let mut set = JoinSet::new();
             let mut complete = 0;
+            let mut spawned = 0;
 
             loop {
-                if complete >= batches.load(Ordering::SeqCst) {
+                let total_batches = batches.load(Ordering::Relaxed);
+
+                if complete >= total_batches {
                     break;
                 }
 
-                // Maintain max connections.
-                {
-                    let concurrency = concurrency.load(Ordering::Relaxed) as u32;
-                    while set.len() >= concurrency as usize {
-                        if let Some(Ok(true)) = set.join_next().await {
-                            complete += 1;
-                        }
-                    }
+                // Maintain desired concurrency
+                let current_concurrency = concurrency.load(Ordering::Relaxed);
 
-                    // TODO: replace sqlx pool.
-                    // if pool.options().get_min_connections() != concurrency {
-                    //     pool.options().min_connections(concurrency);
-                    //     pool.options().max_connections(concurrency);
-                    // }
-                }
-
-                // FIXME: This loop is buggy - it doesn't complete inflight
-
-                let remaining = batches
-                    .load(Ordering::SeqCst)
-                    .saturating_sub(complete + set.len());
-                if remaining > 0 {
+                // Spawn new tasks to maintain concurrency level
+                while set.len() < current_concurrency && spawned < total_batches {
                     set.spawn(executor.clone().execute_batch_with_retry(
                         pool.clone(),
                         tx.clone(),
                         always_rollback,
                     ));
+                    spawned += 1;
+                }
+
+                // Wait for at least one task to complete before continuing
+                if !set.is_empty() {
+                    if let Some(Ok(true)) = set.join_next().await {
+                        complete += 1;
+                    }
+                } else if spawned >= total_batches {
+                    // All tasks spawned and completed
+                    break;
+                } else {
+                    // Avoid busy-waiting when no tasks are running
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                 }
             }
 
-            while set.join_next().await.is_some() {}
-            tx.send(Message::WorkloadComplete).await?;
+            // Wait for any remaining tasks
+            while let Some(result) = set.join_next().await {
+                if let Ok(true) = result {
+                    complete += 1;
+                }
+            }
 
+            tx.send(Message::WorkloadComplete).await?;
             Ok(())
         })
     }
