@@ -7,16 +7,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use async_rate_limiter::RateLimiter;
 use aws_config::SdkConfig;
 use aws_sdk_dsql::auth_token::{self, AuthTokenGenerator};
 use futures::{
-    future::{FusedFuture, OptionFuture},
     FutureExt,
+    future::{FusedFuture, OptionFuture},
 };
 use tokio::{
-    sync::{mpsc, Mutex},
+    sync::{Mutex, mpsc},
     task::JoinSet,
 };
 use tokio_postgres::{Config, Statement};
@@ -235,8 +235,13 @@ impl ConnectionPool {
         Ok((pool, telemetry_rx))
     }
 
-    pub async fn borrow(&self) -> ClientHandle {
-        self.inner.lock().await.borrow().await
+    pub async fn borrow(&self) -> Result<ClientHandle> {
+        let client = self.inner.lock().await.borrow().await;
+        if let Some(client) = client {
+            Ok(client)
+        } else {
+            Err(anyhow!("Connection pool has shut down"))
+        }
     }
 }
 
@@ -246,10 +251,16 @@ struct PoolInner {
 }
 
 impl PoolInner {
-    pub async fn borrow(&mut self) -> ClientHandle {
-        ClientHandle {
-            client: Some(self.obtain.recv().await.expect("pool hasn't crashed")),
-            release: self.release.clone(),
+    pub async fn borrow(&mut self) -> Option<ClientHandle> {
+        match self.obtain.recv().await {
+            Some(client) => Some(ClientHandle {
+                client: Some(client),
+                release: self.release.clone(),
+            }),
+            None => {
+                tracing::warn!("Connection pool has shut down");
+                None
+            }
         }
     }
 }
@@ -278,7 +289,7 @@ async fn maintain(
             };
 
         // now watch for events - either from the `drop` queue returning or
-        // notifying of a connection failure or from one of our connect attempts
+        // notifying of a connection failure or from one of our connect
         tokio::select! {
             _ = launch, if !launch.is_terminated() => {
                 inflight += 1;

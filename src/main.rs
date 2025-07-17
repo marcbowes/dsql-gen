@@ -2,7 +2,7 @@ use std::fs::File;
 use std::num::NonZero;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use clap::Parser;
 use dsql_gen::events::Message;
@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio::task::{self, JoinHandle};
 
 use dsql_gen::runner::{InsertsExecutor, SharedExecutor, SharedWorkload, WorkloadRunner};
-use dsql_gen::ui::MonitorUI;
+use dsql_gen::ui::{HeadlessMonitor, MonitorUI};
 use dsql_gen::usage::{self, Usage, UsageCalculator};
 use tracing::Level;
 use tracing_appender::non_blocking::NonBlocking;
@@ -82,6 +82,14 @@ struct WorkloadArgs {
     /// Workload to run
     #[command(subcommand)]
     workload: WorkloadCommands,
+
+    /// Always rollback transactions (used for specific testing scenarios)
+    #[arg(long, default_value_t = false)]
+    always_rollback: bool,
+
+    /// Run without terminal UI, show final stats only
+    #[arg(long, default_value_t = false)]
+    no_ui: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -154,8 +162,11 @@ async fn run_load_generator(
         NonZero::new(args.concurrency).ok_or_else(|| anyhow!("concurrency must be non-zero"))?,
         args.batches,
         tx.clone(),
+        args.always_rollback,
     )
     .await?;
+
+    let mut usage_task = None::<JoinHandle<Result<()>>>;
 
     if !args.no_usage {
         // make sure this is after the setup runs.
@@ -167,24 +178,75 @@ async fn run_load_generator(
         let tx_usage = tx.clone();
         let mut _watch_usage = watch_usage.clone();
         tx_usage.send(Message::InitialUsage(initial_usage)).await?;
-        let _send_usage: JoinHandle<Result<()>> = tokio::spawn(async move {
+        let send_usage_handle: JoinHandle<Result<()>> = tokio::spawn(async move {
             loop {
                 _watch_usage.changed().await?;
                 let usage = *_watch_usage.borrow();
-                tx_usage.send(Message::UsageUpdated(usage)).await?;
+                if tx_usage.send(Message::UsageUpdated(usage)).await.is_err() {
+                    break; // Channel closed, exit loop
+                }
             }
+            Ok(())
         });
+        usage_task = Some(send_usage_handle);
     }
 
-    // Start the UI in a separate task
-    let ui = task::spawn(async move {
-        let mut ui = MonitorUI::new(rx)?;
-        ui.run(runner).await?;
-        anyhow::Ok(())
-    });
+    if args.no_ui {
+        // Run in headless mode
+        let rows_per_tx = match &args.workload {
+            WorkloadCommands::Tiny(tiny_args) => Some(tiny_args.rows_per_transaction),
+            WorkloadCommands::OneKib(onekib_args) => Some(onekib_args.rows_per_transaction),
+            WorkloadCommands::Counter(_) => None, // Counter doesn't have rows_per_transaction
+        };
 
-    if let Err(err) = ui.await? {
-        eprintln!("{err:?}");
+        let workload_name = match &args.workload {
+            WorkloadCommands::Tiny(_) => "tiny".to_string(),
+            WorkloadCommands::OneKib(_) => "onekib".to_string(),
+            WorkloadCommands::Counter(_) => "counter".to_string(),
+        };
+
+        let mut headless = HeadlessMonitor::new(
+            rx,
+            args.concurrency,
+            rows_per_tx,
+            workload_name,
+            args.always_rollback,
+        );
+        headless.run(runner).await?;
+        headless.print_final_stats();
+
+        // Cleanup background tasks
+        if let Some(task) = usage_task {
+            task.abort();
+        }
+
+        // Close the message channel to signal all background tasks to exit
+        drop(tx);
+
+        // Give background tasks more time to clean up (network connections need time)
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    } else {
+        // Start the UI in a separate task
+        let ui = task::spawn(async move {
+            let mut ui = MonitorUI::new(rx)?;
+            ui.run(runner).await?;
+            anyhow::Ok(())
+        });
+
+        if let Err(err) = ui.await? {
+            eprintln!("{err:?}");
+        }
+
+        // Cleanup background tasks
+        if let Some(task) = usage_task {
+            task.abort();
+        }
+
+        // Close the message channel to signal all background tasks to exit
+        drop(tx);
+
+        // Give background tasks more time to clean up (network connections need time)
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
     }
 
     // if args.usage {

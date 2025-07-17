@@ -45,7 +45,7 @@ impl Workload for OneKibRows {
         Ok(())
     }
 
-    async fn transaction(&self, client: ClientHandle) -> Result<Inserts> {
+    async fn transaction(&self, client: &ClientHandle) -> Result<Inserts> {
         let s = client.statement("q", &self.q).await?;
         client.execute(&s, &[]).await?;
         Ok(Inserts {
