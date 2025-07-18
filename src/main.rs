@@ -212,7 +212,7 @@ async fn run_load_generator(
             WorkloadCommands::Tiny(tiny_args) => Some(tiny_args.rows_per_transaction),
             WorkloadCommands::OneKib(onekib_args) => Some(onekib_args.rows_per_transaction),
             WorkloadCommands::Counter(_) => None,
-            WorkloadCommands::Tpcb(_) => Some(3), // FIXME: Make this automatically correctly
+            WorkloadCommands::Tpcb(_) => Some(4), // FIXME: Make this automatically correctly
         };
 
         let workload_name = match &args.workload {
