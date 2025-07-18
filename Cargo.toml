@@ -21,11 +21,13 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
 tracing = "0.1.41"
 tracing-appender = "0.2.3"
 postgres-native-tls = "0.5.1"
-tokio-postgres = "0.7.13"
+tokio-postgres = { version = "0.7.13", features = ["with-uuid-1"] }
 native-tls = { version = "0.2.14", features = ["alpn"] }
 async-trait = "0.1.88"
 async-rate-limiter = { version = "1", features = ["rt-tokio"] }
 futures = "0.3.31"
+uuid = { version = "1.7.0", features = ["v4", "serde"] }
+rand = "0.9.1"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6.0", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }

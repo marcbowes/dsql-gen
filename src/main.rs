@@ -2,7 +2,7 @@ use std::fs::File;
 use std::num::NonZero;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use clap::Parser;
 use dsql_gen::events::Message;
@@ -79,6 +79,10 @@ struct WorkloadArgs {
     /// Whether to watch CloudWatch metrics or not.
     #[arg(long, default_value_t = false)]
     no_usage: bool,
+
+    /// Whether to quit after running the setup code
+    #[arg(long, default_value_t = false)]
+    setup_only: bool,
 
     /// Workload to run
     #[command(subcommand)]
@@ -175,6 +179,10 @@ async fn run_load_generator(
 
     let mut usage_task = None::<JoinHandle<Result<()>>>;
 
+    if args.setup_only {
+        return Ok(());
+    }
+
     if !args.no_usage {
         // make sure this is after the setup runs.
         let initial_usage = calc.get_initial_usage().await?;
@@ -203,13 +211,15 @@ async fn run_load_generator(
         let rows_per_tx = match &args.workload {
             WorkloadCommands::Tiny(tiny_args) => Some(tiny_args.rows_per_transaction),
             WorkloadCommands::OneKib(onekib_args) => Some(onekib_args.rows_per_transaction),
-            WorkloadCommands::Counter(_) => None, // Counter doesn't have rows_per_transaction
+            WorkloadCommands::Counter(_) => None,
+            WorkloadCommands::Tpcb(_) => Some(3), // FIXME: Make this automatically correctly
         };
 
         let workload_name = match &args.workload {
             WorkloadCommands::Tiny(_) => "tiny".to_string(),
             WorkloadCommands::OneKib(_) => "onekib".to_string(),
             WorkloadCommands::Counter(_) => "counter".to_string(),
+            WorkloadCommands::Tpcb(_) => "tcpb".to_string(),
         };
 
         let mut headless = HeadlessMonitor::new(

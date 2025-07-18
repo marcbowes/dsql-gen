@@ -1,6 +1,6 @@
 use std::num::NonZero;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -10,7 +10,7 @@ use aws_config::SdkConfig;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::sleep;
-use tokio_retry::strategy::{ExponentialBackoff, jitter};
+use tokio_retry::strategy::{jitter, ExponentialBackoff};
 
 use crate::events::{Message, QueryErr, QueryOk, QueryResult};
 use crate::pool::{Bundle, ConnectionPool, PoolConfig};
