@@ -4,16 +4,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
-use async_rate_limiter::RateLimiter;
 use async_trait::async_trait;
-use aws_config::SdkConfig;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::sleep;
 use tokio_retry::strategy::{jitter, ExponentialBackoff};
 
 use crate::events::{Message, QueryErr, QueryOk, QueryResult};
-use crate::pool::{Bundle, ConnectionPool, PoolConfig};
+use crate::pool::ConnectionPool;
 use crate::workloads::{Inserts, Workload};
 
 pub type SharedWorkload = Arc<dyn Workload<T = Inserts> + Send + Sync + 'static>;
@@ -31,52 +29,13 @@ pub struct WorkloadRunner {
 impl WorkloadRunner {
     /// Create a new workload runner with the given configuration
     pub async fn new(
-        endpoint: String,
-        user: String,
-        sdk_config: SdkConfig,
-        workload: SharedWorkload,
+        pool: ConnectionPool,
         executor: SharedExecutor,
         concurrency: NonZero<usize>,
         batches: usize,
         tx: mpsc::Sender<Message>,
         always_rollback: bool,
     ) -> Result<Self> {
-        let mut config = tokio_postgres::Config::new();
-        config.host(endpoint);
-        config.user(user);
-        config.dbname("postgres");
-        config.ssl_mode(tokio_postgres::config::SslMode::Require);
-        config.ssl_negotiation(tokio_postgres::config::SslNegotiation::Direct);
-
-        tracing::info!("launching pool");
-        let rate_limiter = RateLimiter::new(10);
-        rate_limiter.burst(1000);
-        let (pool, mut telemetry) = ConnectionPool::launch(
-            Bundle::new_with_sdk_config(config, sdk_config)?,
-            PoolConfig {
-                desired: concurrency,
-                concurrent: concurrency,
-                rate_limiter,
-            },
-        )
-        .await?;
-
-        let _telem = tx.clone();
-        tokio::spawn(async move {
-            while let Some(t) = telemetry.recv().await {
-                _telem.send(Message::PoolTelemetry(t)).await?;
-            }
-            anyhow::Ok(())
-        });
-
-        {
-            tracing::info!("will setup schema");
-            let conn = pool.borrow().await?;
-            tracing::info!("connection acquired");
-            workload.setup(conn).await?;
-            tracing::info!("schema ready");
-        }
-
         let concurrency = Arc::new(AtomicUsize::new(concurrency.get()));
         let batches = Arc::new(AtomicUsize::new(batches));
 
@@ -180,24 +139,27 @@ pub trait BatchExecutor {
 pub struct InsertsExecutor(pub SharedWorkload);
 
 impl InsertsExecutor {
-    async fn attempt(&self, pool: ConnectionPool, always_rollback: bool) -> Result<Inserts> {
-        let client = pool.borrow().await?;
+    async fn attempt(
+        &self,
+        pool: ConnectionPool,
+        tx: mpsc::Sender<Message>,
+        always_rollback: bool,
+    ) -> Result<Inserts> {
+        let mut client = pool.borrow().await?;
+        let transaction = client.transaction().await?;
 
-        client.execute("BEGIN", &[]).await?;
-
-        let result = match self.0.transaction(&client).await {
+        let result = match self.0.transaction(&transaction, tx).await {
             Ok(inserts) => {
                 // Transaction succeeded, commit or rollback based on flag
                 if always_rollback {
-                    client.execute("ROLLBACK", &[]).await?;
+                    transaction.rollback().await?;
                 } else {
-                    client.execute("COMMIT", &[]).await?;
+                    transaction.commit().await?;
                 }
                 Ok(inserts)
             }
             Err(e) => {
-                // Transaction failed, always rollback
-                let _ = client.execute("ROLLBACK", &[]).await; // Ignore rollback errors
+                _ = transaction.rollback().await;
                 Err(e)
             }
         };
@@ -219,7 +181,10 @@ impl BatchExecutor for InsertsExecutor {
         for backoff in retry_strategy {
             let start = Instant::now();
 
-            match self.attempt(pool.clone(), always_rollback).await {
+            match self
+                .attempt(pool.clone(), tx.clone(), always_rollback)
+                .await
+            {
                 Ok(inserts) => {
                     _ = tx
                         .send(Message::QueryResult(QueryResult::Ok(QueryOk {

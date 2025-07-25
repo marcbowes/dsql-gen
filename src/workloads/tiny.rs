@@ -1,8 +1,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use clap::Parser;
+use tokio::sync::mpsc;
+use tokio_postgres::Transaction;
 
-use crate::pool::ClientHandle;
+use crate::{events::*, pool::ClientHandle};
 
 use super::{Inserts, Workload};
 
@@ -32,7 +34,8 @@ impl TinyRows {
 impl Workload for TinyRows {
     type T = Inserts;
 
-    async fn setup(&self, client: ClientHandle) -> Result<()> {
+    async fn setup(&self, client: ClientHandle, tx: mpsc::Sender<Message>) -> Result<()> {
+        tx.table_creating("tiny").await?;
         client
             .execute(
                 "CREATE TABLE IF NOT EXISTS tiny (
@@ -42,12 +45,18 @@ impl Workload for TinyRows {
                 &[],
             )
             .await?;
+        tx.table_created("tiny").await?;
+
         Ok(())
     }
 
-    async fn transaction(&self, client: &ClientHandle) -> Result<Inserts> {
-        let s = client.statement("q", &self.q).await?;
-        client.execute(&s, &[]).await?;
+    async fn transaction(
+        &self,
+        transaction: &Transaction<'_>,
+        _tx: mpsc::Sender<Message>,
+    ) -> Result<Inserts> {
+        // FIXME: prepare a statement
+        transaction.execute(&self.q, &[]).await?;
         Ok(Inserts {
             rows_inserted: self.args.rows_per_transaction,
             logical_bytes_written: self.args.rows_per_transaction * 68,

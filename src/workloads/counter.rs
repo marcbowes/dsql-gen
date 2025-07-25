@@ -1,8 +1,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use clap::Parser;
+use tokio::sync::mpsc;
+use tokio_postgres::Transaction;
 
-use crate::pool::ClientHandle;
+use crate::{events::*, pool::ClientHandle};
 
 use super::{Inserts, Workload};
 
@@ -26,7 +28,8 @@ impl Counter {
 impl Workload for Counter {
     type T = Inserts;
 
-    async fn setup(&self, client: ClientHandle) -> Result<()> {
+    async fn setup(&self, client: ClientHandle, tx: mpsc::Sender<Message>) -> Result<()> {
+        tx.table_creating("counter").await?;
         client
             .execute(
                 "CREATE TABLE IF NOT EXISTS counter (
@@ -36,18 +39,27 @@ impl Workload for Counter {
                 &[],
             )
             .await?;
+        tx.table_created("counter").await?;
+
+        tx.table_loading("counter", 1).await?;
         client
             .execute(
                 "INSERT INTO counter VALUES (1, 0) ON CONFLICT DO NOTHING",
                 &[],
             )
             .await?;
+        tx.table_loaded("counter", 1).await?;
+
         Ok(())
     }
 
-    async fn transaction(&self, client: &ClientHandle) -> Result<Inserts> {
-        let s = client.statement("q", &self.q).await?;
-        client.execute(&s, &[]).await?;
+    async fn transaction(
+        &self,
+        transaction: &Transaction<'_>,
+        _tx: mpsc::Sender<Message>,
+    ) -> Result<Inserts> {
+        // FIXME: prepare a statement
+        transaction.execute(&self.q, &[]).await?;
         Ok(Inserts {
             // FIXME: Not an insert
             rows_inserted: 1,

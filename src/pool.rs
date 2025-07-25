@@ -7,16 +7,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use async_rate_limiter::RateLimiter;
 use aws_config::SdkConfig;
 use aws_sdk_dsql::auth_token::{self, AuthTokenGenerator};
 use futures::{
-    FutureExt,
     future::{FusedFuture, OptionFuture},
+    FutureExt,
 };
 use tokio::{
-    sync::{Mutex, mpsc},
+    sync::{mpsc, Mutex},
     task::JoinSet,
 };
 use tokio_postgres::{Config, Statement};
