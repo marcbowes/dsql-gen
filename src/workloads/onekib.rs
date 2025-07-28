@@ -4,7 +4,7 @@ use clap::Parser;
 use tokio::sync::mpsc;
 use tokio_postgres::Transaction;
 
-use crate::{events::*, pool::ClientHandle};
+use crate::{events::*, pool::ConnectionPool};
 
 use super::{Inserts, Workload};
 
@@ -34,7 +34,8 @@ impl OneKibRows {
 impl Workload for OneKibRows {
     type T = Inserts;
 
-    async fn setup(&self, client: ClientHandle, tx: mpsc::Sender<Message>) -> Result<()> {
+    async fn setup(&self, pool: ConnectionPool, tx: mpsc::Sender<Message>) -> Result<()> {
+        let client = pool.borrow().await?;
         tx.table_creating("onekib").await?;
         client
             .execute(

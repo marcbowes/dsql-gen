@@ -1,6 +1,6 @@
 use std::num::NonZero;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::sleep;
-use tokio_retry::strategy::{jitter, ExponentialBackoff};
+use tokio_retry::strategy::{ExponentialBackoff, jitter};
 
 use crate::events::{Message, QueryErr, QueryOk, QueryResult};
 use crate::pool::ConnectionPool;

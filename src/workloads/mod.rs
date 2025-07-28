@@ -1,6 +1,6 @@
 use std::num::NonZero;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_rate_limiter::RateLimiter;
 use async_trait::async_trait;
 use aws_config::SdkConfig;
@@ -11,7 +11,7 @@ use ui::Ui;
 use crate::{
     cli::WorkloadArgs,
     events::Message,
-    pool::{Bundle, ClientHandle, ConnectionPool, PoolConfig},
+    pool::{Bundle, ConnectionPool, PoolConfig},
     runner::WorkloadRunner,
 };
 
@@ -30,7 +30,7 @@ pub struct Inserts {
 pub trait Workload {
     type T;
 
-    async fn setup(&self, client: ClientHandle, tx: mpsc::Sender<Message>) -> Result<()>;
+    async fn setup(&self, pool: ConnectionPool, tx: mpsc::Sender<Message>) -> Result<()>;
     async fn transaction(
         &self,
         transaction: &Transaction<'_>,
@@ -86,7 +86,7 @@ pub async fn run_load_generator(
 
     // Create the workload runner
     let runner = WorkloadRunner::new(
-        pool,
+        pool.clone(),
         executor,
         concurrency,
         args.batches,
@@ -96,8 +96,7 @@ pub async fn run_load_generator(
     .await?;
 
     ui.on_before_setup();
-    let conn = runner.pool.borrow().await?;
-    workload.setup(conn, tx).await?;
+    workload.setup(pool, tx).await?;
     ui.on_after_setup();
 
     if args.setup_only {

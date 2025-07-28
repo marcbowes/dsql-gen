@@ -43,7 +43,6 @@ pub enum Message {
     TableCreated(String),
     TableLoading(String, usize),
     TableLoaded(String, usize),
-    LoadComplete,
     /// All batches have completed
     WorkloadComplete,
     /// Pool telemetry

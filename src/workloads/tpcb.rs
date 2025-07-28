@@ -1,10 +1,13 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use clap::Parser;
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinSet};
 use tokio_postgres::Transaction;
 
-use crate::{events::*, pool::ClientHandle};
+use crate::{
+    events::*,
+    pool::{ClientHandle, ConnectionPool},
+};
 
 use super::{Inserts, Workload};
 
@@ -27,13 +30,6 @@ pub struct TpcbArgs {
     pub no_deinitialize: bool,
 }
 
-struct TablesCreated {
-    branches: bool,
-    tellers: bool,
-    accounts: bool,
-    _history: bool,
-}
-
 #[derive(Clone)]
 pub struct Tpcb {
     pub args: TpcbArgs,
@@ -44,9 +40,9 @@ impl Tpcb {
         Self { args }
     }
 
-    /// Calculate number of accounts for the given scale
-    pub fn num_accounts(&self) -> usize {
-        self.args.scale * NUM_ACCOUNTS
+    /// Calculate number of branches for the given scale
+    pub fn num_branches(&self) -> usize {
+        self.args.scale
     }
 
     /// Calculate number of tellers for the given scale
@@ -54,295 +50,9 @@ impl Tpcb {
         self.args.scale * NUM_TELLERS
     }
 
-    /// Calculate number of branches for the given scale
-    pub fn num_branches(&self) -> usize {
-        self.args.scale
-    }
-
-    /// Drop all pgbench tables
-    async fn drop_tables(&self, client: &ClientHandle, tx: mpsc::Sender<Message>) -> Result<()> {
-        tx.table_dropping("pgbench_history").await?;
-        client
-            .execute("DROP TABLE IF EXISTS pgbench_history", &[])
-            .await?;
-        tx.table_dropped("pgbench_history").await?;
-
-        tx.table_dropping("pgbench_accounts").await?;
-        client
-            .execute("DROP TABLE IF EXISTS pgbench_accounts", &[])
-            .await?;
-        tx.table_dropped("pgbench_accounts").await?;
-
-        tx.table_dropping("pgbench_tellers").await?;
-        client
-            .execute("DROP TABLE IF EXISTS pgbench_tellers", &[])
-            .await?;
-        tx.table_dropped("pgbench_tellers").await?;
-
-        tx.table_dropping("pgbench_branches").await?;
-        client
-            .execute("DROP TABLE IF EXISTS pgbench_branches", &[])
-            .await?;
-        tx.table_dropped("pgbench_branches").await?;
-
-        Ok(())
-    }
-
-    async fn initialize(
-        &self,
-        client: &ClientHandle,
-        tx: mpsc::Sender<Message>,
-    ) -> Result<TablesCreated> {
-        let branches = self.initialize_branches(client, tx.clone()).await?;
-        let tellers = self.initialize_tellers(client, tx.clone()).await?;
-        let accounts = self.initialize_accounts(client, tx.clone()).await?;
-        let history = self.initialize_history(client, tx.clone()).await?;
-
-        Ok(TablesCreated {
-            branches,
-            tellers,
-            accounts,
-            _history: history,
-        })
-    }
-
-    async fn initialize_branches(
-        &self,
-        client: &ClientHandle,
-        tx: mpsc::Sender<Message>,
-    ) -> Result<bool> {
-        let exists = client
-            .query_one("SELECT to_regclass('pgbench_branches') IS NOT NULL", &[])
-            .await?;
-
-        if exists.get::<'_, _, bool>(0) == true {
-            return Ok(false);
-        }
-
-        tx.table_creating("pgbench_branches").await?;
-        let _ = client
-            .execute(
-                "CREATE TABLE pgbench_branches (
-    bid INTEGER PRIMARY KEY,
-    bbalance INTEGER,
-    filler CHAR(88)
-);",
-                &[],
-            )
-            .await?;
-        tx.table_created("pgbench_branches").await?;
-
-        Ok(true)
-    }
-
-    async fn populate_branches(
-        &self,
-        client: &ClientHandle,
-        tx: mpsc::Sender<Message>,
-    ) -> Result<()> {
-        let mut remaining = self.num_branches();
-        tx.table_loading("pgbench_branches", remaining).await?;
-        let mut start = 1;
-
-        while remaining > 0 {
-            let rows = remaining.min(ROWS_PER_TX);
-            let stop = start + rows - 1; // Subtract 1 to avoid overlap
-            client
-                .execute(
-                    &format!(
-                        "INSERT INTO pgbench_branches (bid, bbalance)
-SELECT bid, 0 FROM generate_series({start}, {stop}) as bid
-"
-                    ),
-                    &[],
-                )
-                .await?;
-            tx.table_loaded("pgbench_branches", rows).await?;
-            remaining -= rows;
-            start = stop + 1; // Start from the next number
-        }
-
-        Ok(())
-    }
-
-    async fn initialize_tellers(
-        &self,
-        client: &ClientHandle,
-        tx: mpsc::Sender<Message>,
-    ) -> Result<bool> {
-        let exists = client
-            .query_one("SELECT to_regclass('pgbench_tellers') IS NOT NULL", &[])
-            .await?;
-
-        if exists.get::<'_, _, bool>(0) == true {
-            return Ok(false);
-        }
-
-        tx.table_creating("pgbench_tellers").await?;
-        let _ = client
-            .execute(
-                "CREATE TABLE pgbench_tellers (
-    tid INTEGER PRIMARY KEY,
-    bid INTEGER,
-    tbalance INTEGER,
-    filler CHAR(84)
-);",
-                &[],
-            )
-            .await?;
-
-        let row = client
-            .query_one(
-                "CREATE INDEX ASYNC pgbench_tellers_bid_idx ON pgbench_tellers (bid)",
-                &[],
-            )
-            .await?;
-
-        let job_id = row.get::<'_, _, String>("job_id");
-        client
-            .execute("CALL sys.wait_for_job($1)", &[&job_id])
-            .await?;
-
-        tx.table_created("pgbench_tellers").await?;
-
-        Ok(true)
-    }
-
-    async fn populate_tellers(
-        &self,
-        client: &ClientHandle,
-        tx: mpsc::Sender<Message>,
-    ) -> Result<()> {
-        let mut remaining = self.num_tellers();
-        tx.table_loading("pgbench_tellers", remaining).await?;
-        let mut start = 1;
-
-        while remaining > 0 {
-            let rows = remaining.min(ROWS_PER_TX);
-            let stop = start + rows - 1; // Subtract 1 to avoid overlap
-            client
-                .execute(
-                    &format!(
-                        "INSERT INTO pgbench_tellers (tid, bid, tbalance)
-SELECT tid, (tid - 1) / {NUM_TELLERS} + 1, 0 FROM generate_series({start}, {stop}) as tid
-",
-                    ),
-                    &[],
-                )
-                .await?;
-            tx.table_loaded("pgbench_tellers", rows).await?;
-            remaining -= rows;
-            start = stop + 1; // Start from the next number
-        }
-
-        Ok(())
-    }
-
-    async fn initialize_accounts(
-        &self,
-        client: &ClientHandle,
-        tx: mpsc::Sender<Message>,
-    ) -> Result<bool> {
-        let exists = client
-            .query_one("SELECT to_regclass('pgbench_accounts') IS NOT NULL", &[])
-            .await?;
-
-        if exists.get::<'_, _, bool>(0) == true {
-            return Ok(false);
-        }
-
-        tx.table_creating("pgbench_accounts").await?;
-
-        let _ = client
-            .execute(
-                "CREATE TABLE pgbench_accounts (
-    aid INTEGER PRIMARY KEY,
-    bid INTEGER,
-    abalance INTEGER,
-    filler CHAR(84)
-);",
-                &[],
-            )
-            .await?;
-
-        let row = client
-            .query_one(
-                "CREATE INDEX ASYNC pgbench_accounts_bid_idx ON pgbench_accounts (bid)",
-                &[],
-            )
-            .await?;
-
-        let job_id = row.get::<'_, _, String>("job_id");
-        client
-            .execute("CALL sys.wait_for_job($1)", &[&job_id])
-            .await?;
-
-        tx.table_created("pgbench_accounts").await?;
-
-        Ok(true)
-    }
-
-    async fn populate_accounts(
-        &self,
-        client: &ClientHandle,
-        tx: mpsc::Sender<Message>,
-    ) -> Result<()> {
-        let mut remaining = self.num_accounts();
-        tx.table_loading("pgbench_accounts", remaining).await?;
-        let mut start = 1;
-
-        while remaining > 0 {
-            let rows = remaining.min(ROWS_PER_TX);
-            let stop = start + rows - 1; // Subtract 1 to avoid overlap
-            client
-                .execute(
-                    &format!(
-                        "INSERT INTO pgbench_accounts (aid, bid, abalance)
-SELECT aid, (aid - 1) / {NUM_ACCOUNTS} + 1, 0 FROM generate_series({start}, {stop}) as aid
-"
-                    ),
-                    &[],
-                )
-                .await?;
-            tx.table_loaded("pgbench_accounts", rows).await?;
-            remaining -= rows;
-            start = stop + 1; // Start from the next number
-        }
-
-        Ok(())
-    }
-
-    async fn initialize_history(
-        &self,
-        client: &ClientHandle,
-        tx: mpsc::Sender<Message>,
-    ) -> Result<bool> {
-        let exists = client
-            .query_one("SELECT to_regclass('pgbench_history') IS NOT NULL", &[])
-            .await?;
-
-        if exists.get::<'_, _, bool>(0) == true {
-            return Ok(false);
-        }
-
-        tx.table_creating("pgbench_history").await?;
-        let _ = client
-            .execute(
-                "CREATE TABLE pgbench_history (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tid INTEGER,
-    bid INTEGER,
-    aid INTEGER,
-    delta INTEGER,
-    mtime TIMESTAMP,
-    filler CHAR(22)
-);",
-                &[],
-            )
-            .await?;
-        tx.table_created("pgbench_history").await?;
-
-        Ok(true)
+    /// Calculate number of accounts for the given scale
+    pub fn num_accounts(&self) -> usize {
+        self.args.scale * NUM_ACCOUNTS
     }
 }
 
@@ -350,23 +60,35 @@ SELECT aid, (aid - 1) / {NUM_ACCOUNTS} + 1, 0 FROM generate_series({start}, {sto
 impl Workload for Tpcb {
     type T = Inserts;
 
-    async fn setup(&self, client: ClientHandle, tx: mpsc::Sender<Message>) -> Result<()> {
+    async fn setup(&self, pool: ConnectionPool, tx: mpsc::Sender<Message>) -> Result<()> {
+        let client = pool.borrow().await?;
+
         if !self.args.no_deinitialize {
-            self.drop_tables(&client, tx.clone()).await?;
+            drop_tables(&client, tx.clone()).await?;
         }
 
         if !self.args.no_initialize {
-            // TODO: pass pool in, do stuff in parallel
-            let created = self.initialize(&client, tx.clone()).await?;
+            let mut j = JoinSet::new();
 
-            if created.branches {
-                self.populate_branches(&client, tx.clone()).await?;
-            }
-            if created.tellers {
-                self.populate_tellers(&client, tx.clone()).await?;
-            }
-            if created.accounts {
-                self.populate_accounts(&client, tx.clone()).await?;
+            j.spawn(initialize_branches(
+                self.num_branches(),
+                pool.clone(),
+                tx.clone(),
+            ));
+            j.spawn(initialize_tellers(
+                self.num_tellers(),
+                pool.clone(),
+                tx.clone(),
+            ));
+            j.spawn(initialize_accounts(
+                self.num_accounts(),
+                pool.clone(),
+                tx.clone(),
+            ));
+            j.spawn(initialize_history(pool.clone(), tx.clone()));
+
+            while let Some(r) = j.join_next().await {
+                _ = r??;
             }
         }
 
@@ -432,4 +154,270 @@ VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)",
             logical_bytes_written: 100,
         })
     }
+}
+
+/// Drop all pgbench tables
+async fn drop_tables(client: &ClientHandle, tx: mpsc::Sender<Message>) -> Result<()> {
+    tx.table_dropping("pgbench_history").await?;
+    client.ddl("DROP TABLE IF EXISTS pgbench_history").await?;
+    tx.table_dropped("pgbench_history").await?;
+
+    tx.table_dropping("pgbench_accounts").await?;
+    client.ddl("DROP TABLE IF EXISTS pgbench_accounts").await?;
+    tx.table_dropped("pgbench_accounts").await?;
+
+    tx.table_dropping("pgbench_tellers").await?;
+    client.ddl("DROP TABLE IF EXISTS pgbench_tellers").await?;
+    tx.table_dropped("pgbench_tellers").await?;
+
+    tx.table_dropping("pgbench_branches").await?;
+    client.ddl("DROP TABLE IF EXISTS pgbench_branches").await?;
+    tx.table_dropped("pgbench_branches").await?;
+
+    Ok(())
+}
+
+async fn initialize_branches(
+    num_branches: usize,
+    pool: ConnectionPool,
+    tx: mpsc::Sender<Message>,
+) -> Result<bool> {
+    let client = pool.borrow().await?;
+
+    let exists = client
+        ._query_one("SELECT to_regclass('pgbench_branches') IS NOT NULL", &[])
+        .await?;
+
+    if exists.get::<'_, _, bool>(0) == true {
+        return Ok(false);
+    }
+
+    tx.table_creating("pgbench_branches").await?;
+    let _ = client
+        .ddl(
+            "CREATE TABLE pgbench_branches (
+    bid INTEGER PRIMARY KEY,
+    bbalance INTEGER,
+    filler CHAR(88)
+);",
+        )
+        .await?;
+    tx.table_created("pgbench_branches").await?;
+
+    populate_branches(num_branches, &client, tx).await?;
+
+    Ok(true)
+}
+
+async fn populate_branches(
+    num_branches: usize,
+    client: &ClientHandle,
+    tx: mpsc::Sender<Message>,
+) -> Result<()> {
+    let mut remaining = num_branches;
+    tx.table_loading("pgbench_branches", remaining).await?;
+    let mut start = 1;
+
+    while remaining > 0 {
+        let rows = remaining.min(ROWS_PER_TX);
+        let stop = start + rows - 1; // Subtract 1 to avoid overlap
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO pgbench_branches (bid, bbalance)
+SELECT bid, 0 FROM generate_series({start}, {stop}) as bid
+"
+                ),
+                &[],
+            )
+            .await?;
+        tx.table_loaded("pgbench_branches", rows).await?;
+        remaining -= rows;
+        start = stop + 1; // Start from the next number
+    }
+
+    Ok(())
+}
+
+async fn initialize_tellers(
+    num_tellers: usize,
+    pool: ConnectionPool,
+    tx: mpsc::Sender<Message>,
+) -> Result<bool> {
+    let client = pool.borrow().await?;
+
+    let exists = client
+        ._query_one("SELECT to_regclass('pgbench_tellers') IS NOT NULL", &[])
+        .await?;
+
+    if exists.get::<'_, _, bool>(0) == true {
+        return Ok(false);
+    }
+
+    tx.table_creating("pgbench_tellers").await?;
+    let _ = client
+        .ddl(
+            "CREATE TABLE pgbench_tellers (
+    tid INTEGER PRIMARY KEY,
+    bid INTEGER,
+    tbalance INTEGER,
+    filler CHAR(84)
+);",
+        )
+        .await?;
+
+    let row = client
+        ._query_one(
+            "CREATE INDEX ASYNC pgbench_tellers_bid_idx ON pgbench_tellers (bid)",
+            &[],
+        )
+        .await?;
+
+    let job_id = row.get::<'_, _, String>("job_id");
+    client
+        .execute("CALL sys.wait_for_job($1)", &[&job_id])
+        .await?;
+
+    tx.table_created("pgbench_tellers").await?;
+
+    populate_tellers(num_tellers, &client, tx).await?;
+
+    Ok(true)
+}
+
+async fn populate_tellers(
+    num_tellers: usize,
+    client: &ClientHandle,
+    tx: mpsc::Sender<Message>,
+) -> Result<()> {
+    let mut remaining = num_tellers;
+    tx.table_loading("pgbench_tellers", remaining).await?;
+    let mut start = 1;
+
+    while remaining > 0 {
+        let rows = remaining.min(ROWS_PER_TX);
+        let stop = start + rows - 1; // Subtract 1 to avoid overlap
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO pgbench_tellers (tid, bid, tbalance)
+SELECT tid, (tid - 1) / {NUM_TELLERS} + 1, 0 FROM generate_series({start}, {stop}) as tid
+",
+                ),
+                &[],
+            )
+            .await?;
+        tx.table_loaded("pgbench_tellers", rows).await?;
+        remaining -= rows;
+        start = stop + 1; // Start from the next number
+    }
+
+    Ok(())
+}
+
+async fn initialize_accounts(
+    num_accounts: usize,
+    pool: ConnectionPool,
+    tx: mpsc::Sender<Message>,
+) -> Result<bool> {
+    let client = pool.borrow().await?;
+
+    let exists = client
+        ._query_one("SELECT to_regclass('pgbench_accounts') IS NOT NULL", &[])
+        .await?;
+
+    if exists.get::<'_, _, bool>(0) == true {
+        return Ok(false);
+    }
+
+    tx.table_creating("pgbench_accounts").await?;
+
+    let _ = client
+        .ddl(
+            "CREATE TABLE pgbench_accounts (
+    aid INTEGER PRIMARY KEY,
+    bid INTEGER,
+    abalance INTEGER,
+    filler CHAR(84)
+);",
+        )
+        .await?;
+
+    let row = client
+        ._query_one(
+            "CREATE INDEX ASYNC pgbench_accounts_bid_idx ON pgbench_accounts (bid)",
+            &[],
+        )
+        .await?;
+
+    let job_id = row.get::<'_, _, String>("job_id");
+    client
+        .execute("CALL sys.wait_for_job($1)", &[&job_id])
+        .await?;
+
+    tx.table_created("pgbench_accounts").await?;
+
+    populate_accounts(num_accounts, &client, tx).await?;
+
+    Ok(true)
+}
+
+async fn populate_accounts(
+    num_accounts: usize,
+    client: &ClientHandle,
+    tx: mpsc::Sender<Message>,
+) -> Result<()> {
+    let mut remaining = num_accounts;
+    tx.table_loading("pgbench_accounts", remaining).await?;
+    let mut start = 1;
+
+    while remaining > 0 {
+        let rows = remaining.min(ROWS_PER_TX);
+        let stop = start + rows - 1; // Subtract 1 to avoid overlap
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO pgbench_accounts (aid, bid, abalance)
+SELECT aid, (aid - 1) / {NUM_ACCOUNTS} + 1, 0 FROM generate_series({start}, {stop}) as aid
+"
+                ),
+                &[],
+            )
+            .await?;
+        tx.table_loaded("pgbench_accounts", rows).await?;
+        remaining -= rows;
+        start = stop + 1; // Start from the next number
+    }
+
+    Ok(())
+}
+
+async fn initialize_history(pool: ConnectionPool, tx: mpsc::Sender<Message>) -> Result<bool> {
+    let client = pool.borrow().await?;
+
+    let exists = client
+        ._query_one("SELECT to_regclass('pgbench_history') IS NOT NULL", &[])
+        .await?;
+
+    if exists.get::<'_, _, bool>(0) == true {
+        return Ok(false);
+    }
+
+    tx.table_creating("pgbench_history").await?;
+    let _ = client
+        .ddl(
+            "CREATE TABLE pgbench_history (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tid INTEGER,
+    bid INTEGER,
+    aid INTEGER,
+    delta INTEGER,
+    mtime TIMESTAMP,
+    filler CHAR(22)
+)",
+        )
+        .await?;
+    tx.table_created("pgbench_history").await?;
+
+    Ok(true)
 }

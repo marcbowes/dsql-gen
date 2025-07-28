@@ -60,7 +60,7 @@ impl Ui {
 
     pub fn on_after_pool_create(&mut self) {
         let pool = &self.state.pool;
-        self.state.pool.disable_steady_tick();
+        pool.disable_steady_tick();
         pool.set_message("connected");
         pool.finish_and_clear();
     }
@@ -79,14 +79,14 @@ impl Ui {
             loads,
         } = &self.state.setup;
         let mut schemas = schemas.lock().unwrap();
-        for (_, pb) in schemas.iter_mut() {
+        for (_, pb) in schemas.drain(..) {
             pb.disable_steady_tick();
             pb.finish_and_clear();
         }
         _ = schema.clear();
 
         let mut loads = loads.lock().unwrap();
-        for (_, pb) in loads.iter_mut() {
+        for (_, pb) in loads.drain(..) {
             pb.disable_steady_tick();
             pb.finish_and_clear();
         }
@@ -164,7 +164,7 @@ impl Default for SetupState {
 
 impl SetupState {
     fn schema_progressbar(&self, name: impl Into<String>) -> ProgressBar {
-        let mut schemas = self.loads.lock().expect("never poisoned");
+        let mut schemas = self.schemas.lock().expect("never poisoned");
 
         match schemas.entry(name.into()) {
             indexmap::map::Entry::Occupied(occupied_entry) => occupied_entry.get().clone(),
@@ -175,6 +175,16 @@ impl SetupState {
                 pb
             }
         }
+    }
+
+    fn finish_schema_progressbar(&self, name: impl Into<String>, message: impl Into<String>) {
+        let mut schemas = self.schemas.lock().expect("never poisoned");
+        let Some(pb) = schemas.shift_remove(&name.into()) else {
+            return;
+        };
+
+        pb.disable_steady_tick();
+        pb.finish_with_message(message.into());
     }
 
     fn load_progressbar(&self, name: impl Into<String>) -> ProgressBar {
@@ -199,6 +209,16 @@ impl SetupState {
             }
         }
     }
+
+    fn finish_load_progressbar(&self, name: impl Into<String>, message: impl Into<String>) {
+        let mut loads = self.loads.lock().expect("never poisoned");
+        let Some(pb) = loads.shift_remove(&name.into()) else {
+            return;
+        };
+
+        pb.disable_steady_tick();
+        pb.finish_with_message(message.into());
+    }
 }
 
 struct WorkloadState {
@@ -218,7 +238,7 @@ impl Default for WorkloadState {
         let pb = multi.add(ProgressBar::hidden());
         pb.set_style(
             ProgressStyle::with_template(
-                "{prefix:.bold.dim} {spinner} {wide_msg} [{elapsed_precise}] [{bar:.cyan/blue}] {pos}/{len} rows ({per_sec}), eta {eta}",
+                "{prefix:.bold.dim} {spinner} {wide_msg} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} rows ({per_sec}), eta {eta}",
             )
                 .unwrap()
                 .with_key("eta", |state: &ProgressState, w: &mut dyn Write| {
@@ -354,9 +374,9 @@ async fn process_events(mut rx: mpsc::Receiver<Message>, state: Arc<State>) {
                 pb.set_message(format!("creating table: {t}"));
             }
             Message::TableCreated(t) => {
-                let pb = &state.setup.schema_progressbar(&t);
-                pb.disable_steady_tick();
-                pb.set_message(format!("created table: {t}"));
+                state
+                    .setup
+                    .finish_schema_progressbar(t.clone(), format!("created table: {t}"));
             }
             Message::TableLoading(t, rows) => {
                 let pb = &state.setup.load_progressbar(&t);
@@ -371,13 +391,10 @@ async fn process_events(mut rx: mpsc::Receiver<Message>, state: Arc<State>) {
                 pb.inc(rows as u64);
 
                 if Some(pb.position()) == pb.length() {
-                    pb.disable_steady_tick();
-                    pb.set_message(format!("loaded: {t}"));
+                    state
+                        .setup
+                        .finish_load_progressbar(t.clone(), format!("loaded: {t}"));
                 }
-            }
-            Message::LoadComplete => {
-                let load = &state.setup.load;
-                _ = load.clear();
             }
             Message::WorkloadComplete => {
                 let wl = state.workload.lock().unwrap();

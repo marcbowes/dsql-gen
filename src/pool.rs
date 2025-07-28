@@ -18,8 +18,10 @@ use futures::{
 use tokio::{
     sync::{mpsc, Mutex},
     task::JoinSet,
+    time::sleep,
 };
-use tokio_postgres::{Config, Statement};
+use tokio_postgres::{types::ToSql, Config, Error, Row, Statement, ToStatement};
+use tokio_retry::strategy::jitter;
 
 pub struct Bundle {
     pub config: Config,
@@ -359,5 +361,60 @@ impl DerefMut for ClientHandle {
 impl Drop for ClientHandle {
     fn drop(&mut self) {
         let _ = self.release.send(self.client.take());
+    }
+}
+
+impl ClientHandle {
+    /// Runs DDL, retrying indefinitely on OCC001
+    pub async fn ddl(&self, ddl: impl Into<String>) -> Result<u64> {
+        let ddl = ddl.into();
+
+        loop {
+            match self.execute(&ddl, &[]).await {
+                Ok(it) => return Ok(it),
+                Err(err) => {
+                    let Some(db_error) = err.as_db_error() else {
+                        Err(err)?
+                    };
+
+                    if db_error.code()
+                        != &tokio_postgres::error::SqlState::T_R_SERIALIZATION_FAILURE
+                    {
+                        Err(err)?
+                    }
+
+                    sleep(jitter(Duration::from_millis(100))).await;
+                }
+            }
+        }
+    }
+
+    /// Like query_one, but with OCC retries
+    pub async fn _query_one<T>(
+        &self,
+        statement: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Row, Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        loop {
+            match self.query_one(statement, params).await {
+                Ok(it) => return Ok(it),
+                Err(err) => {
+                    let Some(db_error) = err.as_db_error() else {
+                        Err(err)?
+                    };
+
+                    if db_error.code()
+                        != &tokio_postgres::error::SqlState::T_R_SERIALIZATION_FAILURE
+                    {
+                        Err(err)?
+                    }
+
+                    sleep(jitter(Duration::from_millis(100))).await;
+                }
+            }
+        }
     }
 }

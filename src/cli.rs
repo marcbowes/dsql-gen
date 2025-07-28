@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use clap::Parser;
 

@@ -4,7 +4,7 @@ use clap::Parser;
 use tokio::sync::mpsc;
 use tokio_postgres::Transaction;
 
-use crate::{events::*, pool::ClientHandle};
+use crate::{events::*, pool::ConnectionPool};
 
 use super::{Inserts, Workload};
 
@@ -28,7 +28,9 @@ impl Counter {
 impl Workload for Counter {
     type T = Inserts;
 
-    async fn setup(&self, client: ClientHandle, tx: mpsc::Sender<Message>) -> Result<()> {
+    async fn setup(&self, pool: ConnectionPool, tx: mpsc::Sender<Message>) -> Result<()> {
+        let client = pool.borrow().await?;
+
         tx.table_creating("counter").await?;
         client
             .execute(
