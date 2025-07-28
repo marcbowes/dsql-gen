@@ -4,12 +4,20 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Result;
+use chrono::{DateTime, Utc};
 use console::Emoji;
+use hdrhistogram::Histogram;
 use indexmap::IndexMap;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
-use tokio::{sync::mpsc, task::JoinHandle};
+use serde_json::json;
+use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
 
-use crate::events::Message;
+use crate::{
+    cli::{WorkloadArgs, WorkloadCommands},
+    events::{Message, QueryResult},
+    runner::WorkloadRunner,
+};
 
 pub struct Ui {
     state: Arc<State>,
@@ -25,6 +33,105 @@ impl Drop for Ui {
 struct State {
     pool: ProgressBar,
     setup: SetupState,
+    workload: Mutex<WorkloadState>,
+}
+
+impl Ui {
+    pub fn new(rx: mpsc::Receiver<Message>) -> Self {
+        let state = Arc::new(State {
+            pool: ProgressBar::hidden(),
+            setup: SetupState::default(),
+            workload: Mutex::new(WorkloadState::default()),
+        });
+
+        let events = tokio::spawn(process_events(rx, state.clone()));
+
+        Ui { state, events }
+    }
+
+    pub fn on_before_pool_create(&mut self) {
+        let pool = &self.state.pool;
+        pool.set_draw_target(ProgressDrawTarget::stderr());
+        pool.set_style(spinner_template());
+        pool.set_message("connecting");
+        pool.set_prefix(phased(1));
+        pool.enable_steady_tick(Duration::from_millis(100));
+    }
+
+    pub fn on_after_pool_create(&mut self) {
+        let pool = &self.state.pool;
+        pool.disable_steady_tick();
+        pool.finish_with_message("connected");
+    }
+
+    pub fn on_before_setup(&mut self) {
+        let SetupState { schema, load, .. } = &self.state.setup;
+        schema.set_draw_target(ProgressDrawTarget::stderr());
+        load.set_draw_target(ProgressDrawTarget::stderr());
+    }
+
+    pub fn on_after_setup(&mut self) {
+        let SetupState {
+            schema,
+            schemas,
+            load,
+            loads,
+        } = &self.state.setup;
+        let mut schemas = schemas.lock().unwrap();
+        for (_, pb) in schemas.iter_mut() {
+            pb.disable_steady_tick();
+            pb.finish_and_clear();
+        }
+        _ = schema.clear();
+
+        let mut loads = loads.lock().unwrap();
+        for (_, pb) in loads.iter_mut() {
+            pb.disable_steady_tick();
+            pb.finish_and_clear();
+        }
+        _ = load.clear();
+    }
+
+    pub async fn run(self, runner: WorkloadRunner, args: WorkloadArgs) -> Result<()> {
+        let rows_per_tx = match &args.workload {
+            WorkloadCommands::Tiny(tiny_args) => Some(tiny_args.rows_per_transaction),
+            WorkloadCommands::OneKib(onekib_args) => Some(onekib_args.rows_per_transaction),
+            WorkloadCommands::Counter(_) => None,
+            WorkloadCommands::Tpcb(_) => Some(4), // FIXME: Make this automatically correctly
+        };
+
+        let workload_name = match &args.workload {
+            WorkloadCommands::Tiny(_) => "tiny".to_string(),
+            WorkloadCommands::OneKib(_) => "onekib".to_string(),
+            WorkloadCommands::Counter(_) => "counter".to_string(),
+            WorkloadCommands::Tpcb(_) => "tcpb".to_string(),
+        };
+
+        {
+            let mut wl = self.state.workload.lock().unwrap();
+            wl.starting_now();
+
+            // Output initial configuration as JSON
+            let start_config = json!({
+                "phase": "start",
+                "start_time_utc": wl.start_time_utc.to_rfc3339(),
+                "workload": workload_name,
+                "total_batches": runner.batches(),
+                "concurrency": runner.concurrency(),
+                "always_rollback": args.always_rollback,
+                "rows_per_transaction": rows_per_tx,
+            });
+            println!("{}", serde_json::to_string(&start_config)?);
+        }
+
+        let running = runner.spawn();
+        running.await??;
+
+        let wl = self.state.workload.lock().unwrap();
+        wl.print_final_stats();
+
+        Ok(())
+    }
 }
 
 struct SetupState {
@@ -89,59 +196,86 @@ impl SetupState {
     }
 }
 
-impl Ui {
-    pub fn new(rx: mpsc::Receiver<Message>) -> Self {
-        let state = Arc::new(State {
-            pool: ProgressBar::hidden(),
-            setup: SetupState::default(),
+struct WorkloadState {
+    latency_histogram: Histogram<u64>,
+    completed_batches: usize,
+    error_count: usize,
+    start_time: Instant,
+    start_time_utc: DateTime<Utc>,
+    errors: Vec<String>,
+}
+
+impl Default for WorkloadState {
+    fn default() -> Self {
+        let now = Instant::now();
+        let now_utc = Utc::now();
+        Self {
+            latency_histogram: Histogram::<u64>::new_with_bounds(1, 60_000 * 10, 3).unwrap(),
+            completed_batches: 0,
+            error_count: 0,
+            start_time: now,
+            start_time_utc: now_utc,
+            errors: Vec::new(),
+        }
+    }
+}
+
+impl WorkloadState {
+    fn starting_now(&mut self) {
+        self.start_time = Instant::now();
+        self.start_time_utc = Utc::now();
+    }
+}
+
+impl WorkloadState {
+    pub fn print_final_stats(&self) {
+        let duration = self.start_time.elapsed();
+        let duration_secs = duration.as_secs_f64();
+        let end_time_utc = Utc::now();
+
+        let mut results = json!({
+            "phase": "results",
+            "end_time_utc": end_time_utc.to_rfc3339(),
+            "duration_s": format!("{:.3}", duration_secs),
+            "completed_batches": self.completed_batches,
+            "error_count": self.error_count,
         });
 
-        let events = tokio::spawn(process_events(rx, state.clone()));
+        if self.completed_batches > 0 {
+            results["throughput_batches_per_sec"] = json!(format!(
+                "{:.1}",
+                self.completed_batches as f64 / duration_secs
+            ));
 
-        Ui { state, events }
-    }
-
-    pub fn on_before_pool_create(&mut self) {
-        let pool = &self.state.pool;
-        pool.set_draw_target(ProgressDrawTarget::stderr());
-        pool.set_style(spinner_template());
-        pool.set_message("connecting");
-        pool.set_prefix(phased(1));
-        pool.enable_steady_tick(Duration::from_millis(100));
-    }
-
-    pub fn on_after_pool_create(&mut self) {
-        let pool = &self.state.pool;
-        pool.disable_steady_tick();
-        pool.finish_with_message("connected");
-    }
-
-    pub fn on_before_setup(&mut self) {
-        let SetupState { schema, load, .. } = &self.state.setup;
-        schema.set_draw_target(ProgressDrawTarget::stderr());
-        load.set_draw_target(ProgressDrawTarget::stderr());
-    }
-
-    pub fn on_after_setup(&mut self) {
-        let SetupState {
-            schema,
-            schemas,
-            load,
-            loads,
-        } = &self.state.setup;
-        let mut schemas = schemas.lock().unwrap();
-        for (_, pb) in schemas.iter_mut() {
-            pb.disable_steady_tick();
-            pb.finish_and_clear();
+            if self.latency_histogram.len() > 0 {
+                let latency_stats = json!({
+                    "p50_ms": format!("{:.1}", self.latency_histogram.value_at_quantile(0.5) as f64),
+                    "p95_ms": format!("{:.1}", self.latency_histogram.value_at_quantile(0.95) as f64),
+                    "p99_ms": format!("{:.1}", self.latency_histogram.value_at_quantile(0.99) as f64),
+                    "p999_ms": format!("{:.1}", self.latency_histogram.value_at_quantile(0.999) as f64),
+                    "max_ms": format!("{:.1}", self.latency_histogram.max() as f64),
+                    "mean_ms": format!("{:.1}", self.latency_histogram.mean()),
+                    "stddev_ms": format!("{:.1}", self.latency_histogram.stdev()),
+                });
+                results["latency"] = latency_stats;
+            }
         }
-        _ = schema.clear();
 
-        let mut loads = loads.lock().unwrap();
-        for (_, pb) in loads.iter_mut() {
-            pb.disable_steady_tick();
-            pb.finish_and_clear();
+        // Include errors in the results
+        if self.error_count > 0 && !self.errors.is_empty() {
+            let errors: Vec<String> = self
+                .errors
+                .iter()
+                .take(5)
+                .map(|e| e.replace('\t', " ").replace('\n', " "))
+                .collect();
+            results["errors"] = json!(errors);
         }
-        _ = load.clear();
+
+        // Output the final results as JSON
+        if let Ok(json_string) = serde_json::to_string(&results) {
+            println!("{}", json_string);
+        }
     }
 }
 
@@ -163,7 +297,20 @@ fn spinner_template() -> ProgressStyle {
 async fn process_events(mut rx: mpsc::Receiver<Message>, state: Arc<State>) {
     while let Some(event) = rx.recv().await {
         match event {
-            Message::QueryResult(_query_result) => {}
+            Message::QueryResult(result) => match result {
+                QueryResult::Ok(ok) => {
+                    let mut wl = state.workload.lock().unwrap();
+                    wl.latency_histogram
+                        .record(ok.duration.as_millis() as u64)
+                        .unwrap_or(());
+                    wl.completed_batches += 1;
+                }
+                QueryResult::Err(err) => {
+                    let mut wl = state.workload.lock().unwrap();
+                    wl.error_count += 1;
+                    wl.errors.push(err.msg);
+                }
+            },
             Message::InitialUsage(_usage) => {}
             Message::UsageUpdated(_usage) => {}
             Message::TableDropping(t) => {
@@ -209,7 +356,9 @@ async fn process_events(mut rx: mpsc::Receiver<Message>, state: Arc<State>) {
                 let load = &state.setup.load;
                 _ = load.clear();
             }
-            Message::WorkloadComplete => {}
+            Message::WorkloadComplete => {
+                // nothing to do; runner exits
+            }
             Message::PoolTelemetry(telemetry) => match telemetry {
                 crate::pool::Telemetry::Connected(_) => {}
                 crate::pool::Telemetry::Disconnected(_) => {}

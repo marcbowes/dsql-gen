@@ -1,15 +1,15 @@
-use std::{num::NonZero, time::Duration};
+use std::num::NonZero;
 
 use anyhow::{anyhow, Result};
 use async_rate_limiter::RateLimiter;
 use async_trait::async_trait;
 use aws_config::SdkConfig;
-use tokio::{sync::mpsc, time::sleep};
+use tokio::sync::mpsc;
 use tokio_postgres::Transaction;
 use ui::Ui;
 
 use crate::{
-    cli::{WorkloadArgs, WorkloadCommands},
+    cli::WorkloadArgs,
     events::Message,
     pool::{Bundle, ClientHandle, ConnectionPool, PoolConfig},
     runner::WorkloadRunner,
@@ -50,7 +50,7 @@ pub async fn run_load_generator(
 
     let mut config = tokio_postgres::Config::new();
     config.host(args.endpoint(&identifier, &sdk_config)?);
-    config.user(args.user);
+    config.user(&args.user);
     config.dbname("postgres");
     config.ssl_mode(tokio_postgres::config::SslMode::Require);
     config.ssl_negotiation(tokio_postgres::config::SslNegotiation::Direct);
@@ -97,33 +97,14 @@ pub async fn run_load_generator(
 
     ui.on_before_setup();
     let conn = runner.pool.borrow().await?;
-    workload.setup(conn, tx.clone()).await?;
+    workload.setup(conn, tx).await?;
     ui.on_after_setup();
 
     if args.setup_only {
         return Ok(());
     }
 
-    // Run in headless mode
-    let rows_per_tx = match &args.workload {
-        WorkloadCommands::Tiny(tiny_args) => Some(tiny_args.rows_per_transaction),
-        WorkloadCommands::OneKib(onekib_args) => Some(onekib_args.rows_per_transaction),
-        WorkloadCommands::Counter(_) => None,
-        WorkloadCommands::Tpcb(_) => Some(4), // FIXME: Make this automatically correctly
-    };
-
-    let workload_name = match &args.workload {
-        WorkloadCommands::Tiny(_) => "tiny".to_string(),
-        WorkloadCommands::OneKib(_) => "onekib".to_string(),
-        WorkloadCommands::Counter(_) => "counter".to_string(),
-        WorkloadCommands::Tpcb(_) => "tcpb".to_string(),
-    };
-
-    // Close the message channel to signal all background tasks to exit
-    drop(tx);
-
-    // Give background tasks more time to clean up (network connections need time)
-    sleep(Duration::from_millis(1000)).await;
+    ui.run(runner, args).await?;
 
     Ok(())
 }
