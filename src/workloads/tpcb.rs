@@ -68,26 +68,26 @@ impl Workload for Tpcb {
         }
 
         if !self.args.no_initialize {
-            let mut j = JoinSet::new();
+            let mut inits = JoinSet::new();
 
-            j.spawn(initialize_branches(
+            inits.spawn(initialize_branches(
                 self.num_branches(),
                 pool.clone(),
                 tx.clone(),
             ));
-            j.spawn(initialize_tellers(
+            inits.spawn(initialize_tellers(
                 self.num_tellers(),
                 pool.clone(),
                 tx.clone(),
             ));
-            j.spawn(initialize_accounts(
+            inits.spawn(initialize_accounts(
                 self.num_accounts(),
                 pool.clone(),
                 tx.clone(),
             ));
-            j.spawn(initialize_history(pool.clone(), tx.clone()));
+            inits.spawn(initialize_history(pool.clone(), tx.clone()));
 
-            while let Some(r) = j.join_next().await {
+            while let Some(r) = inits.join_next().await {
                 _ = r??;
             }
         }
@@ -158,21 +158,21 @@ VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)",
 
 /// Drop all pgbench tables
 async fn drop_tables(client: &ClientHandle, tx: mpsc::Sender<Message>) -> Result<()> {
-    tx.table_dropping("pgbench_history").await?;
-    client.ddl("DROP TABLE IF EXISTS pgbench_history").await?;
-    tx.table_dropped("pgbench_history").await?;
-
-    tx.table_dropping("pgbench_accounts").await?;
-    client.ddl("DROP TABLE IF EXISTS pgbench_accounts").await?;
-    tx.table_dropped("pgbench_accounts").await?;
+    tx.table_dropping("pgbench_branches").await?;
+    client.ddl("DROP TABLE IF EXISTS pgbench_branches").await?;
+    tx.table_dropped("pgbench_branches").await?;
 
     tx.table_dropping("pgbench_tellers").await?;
     client.ddl("DROP TABLE IF EXISTS pgbench_tellers").await?;
     tx.table_dropped("pgbench_tellers").await?;
 
-    tx.table_dropping("pgbench_branches").await?;
-    client.ddl("DROP TABLE IF EXISTS pgbench_branches").await?;
-    tx.table_dropped("pgbench_branches").await?;
+    tx.table_dropping("pgbench_accounts").await?;
+    client.ddl("DROP TABLE IF EXISTS pgbench_accounts").await?;
+    tx.table_dropped("pgbench_accounts").await?;
+
+    tx.table_dropping("pgbench_history").await?;
+    client.ddl("DROP TABLE IF EXISTS pgbench_history").await?;
+    tx.table_dropped("pgbench_history").await?;
 
     Ok(())
 }
