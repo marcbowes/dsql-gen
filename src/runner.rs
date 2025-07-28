@@ -1,7 +1,7 @@
 use std::num::NonZero;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -177,7 +177,9 @@ impl BatchExecutor for InsertsExecutor {
         tx: mpsc::Sender<Message>,
         always_rollback: bool,
     ) -> bool {
-        let retry_strategy = ExponentialBackoff::from_millis(10).map(jitter);
+        let retry_strategy = ExponentialBackoff::from_millis(2)
+            .max_delay(jitter(Duration::from_secs(3)))
+            .map(jitter);
         for backoff in retry_strategy {
             let start = Instant::now();
 
@@ -196,6 +198,8 @@ impl BatchExecutor for InsertsExecutor {
                     return true;
                 }
                 Err(err) => {
+                    tracing::trace!(target: "executor", ?err, "attempt err");
+
                     if tx
                         .send(Message::QueryResult(QueryResult::Err(QueryErr {
                             duration: start.elapsed(),
@@ -208,6 +212,8 @@ impl BatchExecutor for InsertsExecutor {
                     }
                 }
             }
+
+            tracing::trace!(target: "executor", ?backoff, "backing off");
             sleep(backoff).await;
         }
         false

@@ -60,8 +60,9 @@ impl Ui {
 
     pub fn on_after_pool_create(&mut self) {
         let pool = &self.state.pool;
-        pool.disable_steady_tick();
-        pool.finish_with_message("connected");
+        self.state.pool.disable_steady_tick();
+        pool.set_message("connected");
+        pool.finish_and_clear();
     }
 
     pub fn on_before_setup(&mut self) {
@@ -110,6 +111,9 @@ impl Ui {
         {
             let mut wl = self.state.workload.lock().unwrap();
             wl.starting_now();
+            wl.multi.set_draw_target(ProgressDrawTarget::stderr());
+            wl.pb.set_length(runner.batches() as u64);
+            wl.pb.enable_steady_tick(Duration::from_millis(100));
 
             // Output initial configuration as JSON
             let start_config = json!({
@@ -121,13 +125,14 @@ impl Ui {
                 "always_rollback": args.always_rollback,
                 "rows_per_transaction": rows_per_tx,
             });
-            println!("{}", serde_json::to_string(&start_config)?);
+            _ = wl.multi.println(serde_json::to_string(&start_config)?);
         }
 
         let running = runner.spawn();
         running.await??;
 
         let wl = self.state.workload.lock().unwrap();
+        wl.pb.disable_steady_tick();
         wl.print_final_stats();
 
         Ok(())
@@ -197,6 +202,8 @@ impl SetupState {
 }
 
 struct WorkloadState {
+    multi: MultiProgress,
+    pb: ProgressBar,
     latency_histogram: Histogram<u64>,
     completed_batches: usize,
     error_count: usize,
@@ -207,9 +214,24 @@ struct WorkloadState {
 
 impl Default for WorkloadState {
     fn default() -> Self {
+        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
+        let pb = multi.add(ProgressBar::hidden());
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{prefix:.bold.dim} {spinner} {wide_msg} [{elapsed_precise}] [{bar:.cyan/blue}] {pos}/{len} rows ({per_sec}), eta {eta}",
+            )
+                .unwrap()
+                .with_key("eta", |state: &ProgressState, w: &mut dyn Write| {
+                    write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap()
+                })
+                .progress_chars("#>-")
+        );
+
         let now = Instant::now();
         let now_utc = Utc::now();
         Self {
+            multi,
+            pb,
             latency_histogram: Histogram::<u64>::new_with_bounds(1, 60_000 * 10, 3).unwrap(),
             completed_batches: 0,
             error_count: 0,
@@ -274,7 +296,7 @@ impl WorkloadState {
 
         // Output the final results as JSON
         if let Ok(json_string) = serde_json::to_string(&results) {
-            println!("{}", json_string);
+            _ = self.multi.println(json_string);
         }
     }
 }
@@ -304,6 +326,7 @@ async fn process_events(mut rx: mpsc::Receiver<Message>, state: Arc<State>) {
                         .record(ok.duration.as_millis() as u64)
                         .unwrap_or(());
                     wl.completed_batches += 1;
+                    wl.pb.inc(1);
                 }
                 QueryResult::Err(err) => {
                     let mut wl = state.workload.lock().unwrap();
@@ -333,7 +356,7 @@ async fn process_events(mut rx: mpsc::Receiver<Message>, state: Arc<State>) {
             Message::TableCreated(t) => {
                 let pb = &state.setup.schema_progressbar(&t);
                 pb.disable_steady_tick();
-                pb.finish_with_message(format!("created table: {t}"));
+                pb.set_message(format!("created table: {t}"));
             }
             Message::TableLoading(t, rows) => {
                 let pb = &state.setup.load_progressbar(&t);
@@ -349,7 +372,7 @@ async fn process_events(mut rx: mpsc::Receiver<Message>, state: Arc<State>) {
 
                 if Some(pb.position()) == pb.length() {
                     pb.disable_steady_tick();
-                    pb.finish_with_message(format!("loaded: {t}"));
+                    pb.set_message(format!("loaded: {t}"));
                 }
             }
             Message::LoadComplete => {
@@ -357,7 +380,8 @@ async fn process_events(mut rx: mpsc::Receiver<Message>, state: Arc<State>) {
                 _ = load.clear();
             }
             Message::WorkloadComplete => {
-                // nothing to do; runner exits
+                let wl = state.workload.lock().unwrap();
+                wl.pb.finish_with_message("workload complete");
             }
             Message::PoolTelemetry(telemetry) => match telemetry {
                 crate::pool::Telemetry::Connected(_) => {}
