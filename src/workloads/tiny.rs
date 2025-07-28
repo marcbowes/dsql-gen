@@ -10,7 +10,7 @@ use super::{Inserts, Workload};
 
 #[derive(Parser, Debug, Clone)]
 pub struct TinyRowsArgs {
-    #[arg(short, long)]
+    #[arg(short, long, default_value_t = 3000)]
     pub rows_per_transaction: usize,
 }
 
