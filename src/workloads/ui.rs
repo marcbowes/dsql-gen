@@ -92,7 +92,7 @@ impl Ui {
             WorkloadCommands::Tiny(_) => "tiny".to_string(),
             WorkloadCommands::OneKib(_) => "onekib".to_string(),
             WorkloadCommands::Counter(_) => "counter".to_string(),
-            WorkloadCommands::Tpcb(_) => "tcpb".to_string(),
+            WorkloadCommands::Tpcb(_) => "tpcb".to_string(),
         };
 
         {
