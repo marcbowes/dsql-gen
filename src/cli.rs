@@ -25,6 +25,10 @@ pub struct Args {
     #[arg(short, long, env = "AWS_REGION")]
     pub region: Option<String>,
 
+    /// AWS profile
+    #[arg(short, long, env = "AWS_PROFILE")]
+    pub profile: Option<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -34,6 +38,9 @@ impl Args {
         let mut loader = aws_config::defaults(BehaviorVersion::latest());
         if let Some(r) = &self.region {
             loader = loader.region(Region::new(r.clone()));
+        }
+        if let Some(p) = &self.profile {
+            loader = loader.profile_name(p);
         }
         loader.load().await
     }
