@@ -1,6 +1,6 @@
-use std::num::NonZero;
+use std::{num::NonZero, time::Duration};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_rate_limiter::RateLimiter;
 use async_trait::async_trait;
 use aws_config::SdkConfig;
@@ -54,6 +54,9 @@ pub async fn run_load_generator(
     config.dbname("postgres");
     config.ssl_mode(tokio_postgres::config::SslMode::Require);
     config.ssl_negotiation(tokio_postgres::config::SslNegotiation::Direct);
+    config.connect_timeout(Duration::from_secs(30));
+    config.keepalives_idle(Duration::from_secs(600));
+    config.tcp_user_timeout(Duration::from_secs(60));
 
     let concurrency =
         NonZero::new(args.concurrency).ok_or_else(|| anyhow!("concurrency must be non-zero"))?;
