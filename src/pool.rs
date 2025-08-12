@@ -41,6 +41,12 @@ impl Bundle {
             bail!("you must specify a user");
         }
 
+        // Configure connection parameters for AWS DSQL
+        config.ssl_negotiation(tokio_postgres::config::SslNegotiation::Postgres);
+        config.connect_timeout(std::time::Duration::from_secs(30));
+        config.keepalives_idle(std::time::Duration::from_secs(600));
+        config.tcp_user_timeout(std::time::Duration::from_secs(60));
+
         // FIXME: Temporary hack for testing against rds
         let connector = if let Ok(pgpass) = std::env::var("PGPASSWORD") {
             config.password(pgpass);
