@@ -172,7 +172,7 @@ impl Default for WorkloadState {
         let pb = multi.add(ProgressBar::hidden());
         pb.set_style(
             ProgressStyle::with_template(
-                "{prefix:.bold.dim} {spinner} {wide_msg} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} rows ({per_sec}), eta {eta}",
+                "{prefix:.bold.dim} {spinner} {wide_msg} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} txs ({per_sec}), eta {eta}",
             )
                 .unwrap()
                 .with_key("eta", |state: &ProgressState, w: &mut dyn Write| {
